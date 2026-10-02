@@ -157,6 +157,46 @@ async def test_explicit_tool_choice_reaches_inference_backend(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_streaming_routes_terminate_with_protocol_marker(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
+    backend = FakeInferenceBackend(response="Streamed answer.")
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "public-id",
+                "messages": [{"role": "user", "content": "Answer."}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    if path == "/api/chat":
+        records = [json.loads(line) for line in response.text.splitlines()]
+        assert records[-1]["done"] is True
+        assert records[-1]["message"]["content"] == "Streamed answer."
+    else:
+        events = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(event) for event in events[:-1]]
+        content = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+        assert content == "Streamed answer."
+
+
+@pytest.mark.asyncio
 async def test_discovery_lists_only_configured_usable_hefs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
