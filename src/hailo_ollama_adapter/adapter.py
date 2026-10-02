@@ -1,10 +1,7 @@
-"""Hailo-to-OpenAI/Ollama API adapter.
+"""Direct HailoRT backend with OpenAI- and Ollama-compatible APIs.
 
-A FastAPI adapter that exposes OpenAI- and Ollama-compatible HTTP endpoints
-while proxying requests to a local Hailo 5.3.0 inference server.
-
-Works around Hailo 5.3.0 prompt-renderer quirks: control-character rejection,
-newline-in-content rejection, and system-role-on-continuation rejection.
+The native runtime is initialized lazily through the FastAPI lifespan so
+protocol tests and fake backends do not require HailoRT bindings.
 """
 
 from __future__ import annotations
@@ -69,16 +66,6 @@ app = FastAPI(title="Hailo Adapter", version="1.0.0", lifespan=_lifespan)
 def _sanitize(text: str) -> str:
     """Strip ASCII control chars that Hailo's parser rejects."""
     return _CONTROL_CHAR_RE.sub("", text)
-
-
-def _flatten_newlines(text: str) -> str:
-    """Collapse newlines to spaces.
-
-    Hailo 5.3.0's prompt renderer re-encodes content through an internal
-    template that doesn't escape newlines, so any literal newline -- even
-    when the outer JSON correctly escapes it -- causes a parse error.
-    """
-    return text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
 
 
 def _deep_sanitize(obj: Any) -> Any:

@@ -24,7 +24,7 @@ setup(
     name="hailo-ollama-openclaw-adapter",
     version="2.0.0",
     description=(
-        "FastAPI adapter bridging Hailo-Ollama to OpenClaw 2026.4.20 on Raspberry Pi"
+        "FastAPI adapter using direct HailoRT GenAI for Ollama and OpenAI APIs"
     ),
     long_description=_read_long_description(),
     long_description_content_type="text/markdown",
@@ -43,7 +43,6 @@ setup(
     packages=find_packages(where="src"),
     install_requires=[
         "fastapi>=0.100",
-        "httpx>=0.25",
         "uvicorn[standard]>=0.24",
     ],
     extras_require={
@@ -51,6 +50,7 @@ setup(
             "ruff>=0.5",
             "pytest>=7",
             "pytest-asyncio>=0.23",
+            "httpx>=0.25",
         ],
     },
     entry_points={

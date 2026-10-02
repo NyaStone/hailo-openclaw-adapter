@@ -1,4 +1,4 @@
-# Hailo-Ollama to OpenClaw Adapter
+# Direct Hailo to OpenClaw Adapter
 
 ![HailoRT](https://img.shields.io/badge/HailoRT-5.3.0-success)
 ![Ollama](https://img.shields.io/badge/Ollama-0.6.0-blue)
@@ -8,8 +8,8 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 
-A FastAPI adapter that bridges [Hailo-Ollama](https://hailo.ai/) with [OpenClaw](https://openclaw.ai/) by
-exposing OpenAI- and Ollama-compatible HTTP endpoints.
+A FastAPI adapter that exposes OpenAI- and Ollama-compatible endpoints and
+runs text generation directly through HailoRT GenAI in the Hailo Apps runtime.
 
 Built and tested on **Raspberry Pi 5 with Hailo-10H running Raspberry Pi
 OS (Debian 13 "Trixie")**. Requires **Python 3.10 or newer**.
@@ -17,7 +17,7 @@ OS (Debian 13 "Trixie")**. Requires **Python 3.10 or newer**.
 <p align="center">
   <img src="docs/images/openclaw-dashboard.jpg" alt="OpenClaw dashboard chatting with qwen3 via Hailo" width="800">
   <br>
-  <em>OpenClaw dashboard chatting with <code>qwen3:1.7b</code> accelerated on Hailo-10H</em>
+  <em>OpenClaw dashboard chatting with a Hailo-10H accelerated model</em>
 </p>
 
 ---
@@ -25,68 +25,39 @@ OS (Debian 13 "Trixie")**. Requires **Python 3.10 or newer**.
 ## What this adapter does
 
 OpenClaw talks to language-model providers using the Ollama or OpenAI
-wire protocols. Hailo-Ollama exposes its own HTTP API on port 8000 that
-is close to, but not quite, Ollama-compatible. This adapter sits between
-them on port 11435 and translates:
+wire protocols. This adapter serves those protocols on port 11435 and maps
+the public model ID to an existing, validated HEF:
 
 - OpenClaw -> adapter (standard Ollama `/api/tags`, `/api/show`, `/api/chat`)
-- adapter -> Hailo-Ollama (sanitized chat JSON with the configured local HEF path)
+- adapter -> HailoRT GenAI (structured conversation and generation options)
 
-It also handles three Hailo 5.3.0 changes that would otherwise break the
-conversation: strict JSON parsing (control chars rejected), newline-in-
-content rejection, and the system-role-on-continuation restriction.
+No Hailo-Ollama server or port-8000 service is used. The native device and
+model are initialized at application startup and released at shutdown.
 
 ---
 
-## Why this version
+## Runtime design
 
-Earlier adapter builds in this repo used OpenClaw's `openai-completions`
-provider and spoke to Hailo-Ollama using the OpenAI chat-completions
-wire format. That worked for a while, but several things broke together
-around Hailo Model Zoo GenAI 5.3.0 and the OpenClaw 2026.4.x series:
+The adapter keeps model discovery and protocol handling separate from the
+serialized native inference worker. Native Hailo imports are lazy, so fake
+backends can exercise the HTTP API without an accelerator runtime installed.
 
-- **Wire protocol changed on both sides.** OpenClaw rebuilt its Ollama
-  integration to use the native Ollama transport end-to-end, making
-  `openai-completions` the slower/second-class path. Hailo 5.3.0 in
-  parallel tightened its JSON parser and introduced new validation
-  rules. Gluing an OpenAI-shaped request through to a stricter Hailo
-  started producing silent 400s and partial responses.
-- **Hailo 5.3.0 prompt-renderer bugs.** Control characters in strings,
-  literal newlines inside user content, and system-role messages on
-  conversation continuations all became hard errors rather than being
-  silently tolerated. The old adapter had no sanitization for any of
-  these because they hadn't mattered on 5.1.x / 5.2.x.
 - **Explicit model discovery.** Only public IDs mapped to existing HEFs with
   validated profiles are listed. Unknown IDs are rejected, with no fabricated
   fallback model; discovery probes do not acquire the inference slot.
-- **Backpressure handled at the app layer.** The old adapter relied on
-  uvicorn's `--limit-concurrency` for backpressure, which 503'd probe
-  endpoints during OpenClaw's startup burst of `/api/show` calls. This
-  version uses a one-permit `asyncio.Semaphore` that serializes only the
-  chat path; probes read configured model state without waiting for inference.
-- **Disconnect-safe hardware ownership.** Non-streaming calls run in tracked,
-  shielded workers, while streaming calls use a detached drain task. A client
-  disconnect therefore cannot release the one Hailo generation slot early.
-  Ambiguous in-flight transport failures quarantine chat traffic until the
-  adapter restarts.
-- **Native errors stay errors.** Non-success Hailo chat responses preserve
-  their HTTP status and a bounded explicit error message instead of being
-  converted into a successful empty assistant answer. If a stream fails after
-  HTTP 200 is committed, the adapter emits a protocol error record and omits
-  normal completion framing. Only a native JSON-boolean `done: true` marker is
-  authoritative; clean EOF without that marker is treated as a truncated
-  stream and quarantines later chat traffic.
-- **Graceful streaming shutdown.** Hailo's ~13-second generation
-  timeout used to surface as a 100-line ASGI traceback. Now it's caught
-  and logged as a single warning.
+- **Single-owner inference.** Blocking native calls run on one executor thread.
+  One request can wait by default; additional work gets a clear busy response.
+- **Disconnect-safe ownership.** Cancelling or timing out an HTTP waiter does
+  not cancel the native worker or release device ownership before completion.
+- **Readiness and failure states.** `/readyz` reports initialization and
+  inference health; initialization, generation, and cleanup failures are
+  surfaced rather than returned as empty assistant text.
 - **Installable package.** You can now `pip3 install` directly from
   GitHub and get a `hailo-ollama-adapter` command, rather than cloning
   and running `uvicorn` against a loose file.
 
-The `main` branch and the `2026.04.20` tag reflect this rewrite. If you
-find an older fork or gist that uses `api: "openai-completions"` in
-OpenClaw's config or a hardcoded model list, it predates these changes
-and won't work against current Hailo-Ollama or current OpenClaw.
+HailoRT and Hailo Apps are supplied by the target system environment and are
+not installed by this package's ordinary pip dependencies.
 
 ---
 
@@ -95,7 +66,8 @@ and won't work against current Hailo-Ollama or current OpenClaw.
 - **Raspberry Pi 5** with **Hailo-10H** accelerator (PCIe M.2 HAT)
 - **Raspberry Pi OS (Debian 13 "Trixie")**, 64-bit
 - **Python 3.10+** (ships with Trixie)
-- **Hailo-Ollama** installed and reachable on `http://127.0.0.1:8000`
+- **Hailo Apps virtual environment** with compatible HailoRT GenAI bindings
+- An existing supported LLM HEF; chat requests never download models
 - **OpenClaw** CLI installed (`pnpm add -g openclaw@2026.04.20`)
 
 ---
@@ -106,17 +78,17 @@ Configure a public ID for the validated HEF before starting the adapter. Chat
 requests use that existing local HEF path; the adapter does not pull models.
 OpenClaw onboarding should happen after the adapter is serving.
 
-### 1. Start Hailo-Ollama
+### 1. Prepare the Hailo Apps runtime
 
-Start the Hailo-Ollama server per Hailo's documentation. Verify it's
-listening on port 8000:
+Use the Hailo Apps checkout and virtual environment that provide the matching
+HailoRT GenAI Python bindings. HailoRT is installed by the Hailo platform
+setup, not by pip installing this adapter. Activate that environment before
+installing or running the adapter.
 
 ```bash
-curl -s http://127.0.0.1:8000/api/tags
+cd ~/hailo-apps
+source venv_hailo_apps/bin/activate
 ```
-
-The Hailo-Ollama service must be running on port 8000. The adapter's model
-list comes from `HAILO_MODELS`, not from `/api/tags`.
 
 ### 2. Configure a validated HEF
 
@@ -204,13 +176,14 @@ Before starting the adapter, map public model IDs to HEF files with
 `HAILO_MODELS`. The value is a JSON object. Only existing HEFs with a
 validated model profile are exposed; the currently validated profile is
 `Qwen2.5-Coder-1.5B-Instruct.hef` (2,048-token context, completion and tools).
+Mapped models load during application startup and are released at shutdown.
 
 ```bash
 export HAILO_MODELS='{"qwen2.5-coder:1.5b":"/usr/local/hailo/resources/models/hailo10h/Qwen2.5-Coder-1.5B-Instruct.hef"}'
 ```
 
-Check that Hailo-Ollama is running and `HAILO_MODELS` is set, then run any of these
-(they're all equivalent):
+Set `HAILO_MODELS` and `HAILO_QUEUE_SIZE`, then run any of these (they're all
+equivalent):
 
 ```bash
 source venv/bin/activate
@@ -238,7 +211,8 @@ hailo-ollama-adapter --help
   --host HOST                        default: 0.0.0.0
   --port PORT                        default: 11435
   --timeout-keep-alive SECONDS       default: 240
-  --limit-concurrency N              default: 2
+  --limit-concurrency N              default: 2 HTTP connections
+  --queue-size N                     override HAILO_QUEUE_SIZE (default: 1)
   --log-level LEVEL                  default: info
   --reload                           auto-reload on source changes (dev)
 ```
@@ -250,6 +224,9 @@ In a second terminal:
 ```bash
 # Should list the configured, usable HEF profiles
 curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
+
+# Native device/model initialization must succeed for readiness
+curl -i http://127.0.0.1:11435/readyz
 ```
 
 The model ID on the left is what OpenClaw sees and must send on chat requests.
@@ -266,9 +243,9 @@ curl -s -X POST http://127.0.0.1:11435/api/tags/refresh
 
 Before running onboarding, make sure:
 
-- Hailo-Ollama is running on port 8000
+- The adapter is running inside the Hailo Apps virtual environment
 - `HAILO_MODELS` maps the public ID to the validated HEF
-- The adapter is running on port 11435 (Terminal 1 from the previous step)
+- `GET /readyz` returns `200`
 
 Open a **second terminal** and run OpenClaw's interactive onboarding.
 This wires up the gateway, the adapter endpoint, and your default model.
@@ -298,8 +275,7 @@ Arrow down to **Ollama (Cloud and local open models)** and hit Enter.
 ### Step 3 - Point to the adapter and pick a default model
 
 - **Ollama mode**: `Local only`
-- **Ollama base URL**: `http://127.0.0.1:11435` (the **adapter**, not
-  Hailo-Ollama directly - adapter runs on 11435, Hailo on 8000)
+- **Ollama base URL**: `http://127.0.0.1:11435` (the adapter)
 - **Default model**: pick one of the public IDs configured in `HAILO_MODELS`.
 
 <p align="center">
@@ -338,14 +314,12 @@ you configured; the current validated profile is Qwen2.5-Coder-1.5B on HAILO10H.
 Once configured, each time you want to use OpenClaw with Hailo:
 
 ```bash
-# 1. Make sure Hailo-Ollama is running on port 8000
-curl -s http://127.0.0.1:8000/api/tags  # quick health check
-
-# 2. Terminal 1: start the adapter
-source ~/hailo-ollama-openclaw-adapter/venv/bin/activate
+# 1. Activate the Hailo Apps environment and start the adapter
+cd ~/hailo-apps
+source venv_hailo_apps/bin/activate
 hailo-ollama-adapter
 
-# 3. Terminal 2: open the dashboard
+# 2. Terminal 2: open the dashboard
 openclaw dashboard
 ```
 
@@ -360,6 +334,7 @@ Press `Ctrl+C` in the adapter terminal when you're done.
 | GET    | `/api/tags`                       | Configured, usable HEF model list          |
 | POST   | `/api/tags/refresh`               | Recheck configured HEF paths               |
 | POST   | `/api/show`                       | Ollama model details                       |
+| GET    | `/readyz`                         | Native backend readiness                   |
 | POST   | `/api/chat`                       | Ollama chat endpoint                       |
 | POST   | `/chat/completions`               | OpenAI-compatible chat endpoint            |
 | POST   | `/v1/chat/completions`            | OpenAI-compatible chat (alt path)          |
@@ -373,29 +348,20 @@ the public ID in client-facing responses.
 
 ## Configuration knobs
 
-Configure the public ID to HEF path mapping with `HAILO_MODELS`, as described
-above. Request timeout, history, and concurrency limits are constants in
-`src/hailo_ollama_adapter/adapter.py`.
+Configure public IDs to HEF paths with `HAILO_MODELS`. `HAILO_QUEUE_SIZE`
+controls how many requests may wait behind the active generation (default 1).
+Inference itself is always serialized because the Hailo device and model
+context have one owner. Request deadlines are 180 seconds; a timed-out client
+does not cancel native work or make the device available early.
 
-```python
-HAILO_URL = "http://127.0.0.1:8000/api/chat"
-
-REQUEST_TIMEOUT = 180.0             # seconds for a single Hailo chat call
-MAX_USER_CONTENT_CHARS = 2000       # truncate long user messages
-MAX_EXTRACTED_INTENT_CHARS = 500    # OpenClaw bootstrap envelope trim
-MAX_HISTORY_TURNS = 7               # how many prior turns to keep
-MAX_CONCURRENT_HAILO_CALLS = 2      # app-level backpressure
+```bash
+HAILO_MODELS='{"qwen2.5-coder:1.5b":"/path/to/Qwen2.5-Coder-1.5B-Instruct.hef"}'
+HAILO_QUEUE_SIZE=1
 ```
 
-The concurrency limit is enforced inside the adapter with an
-`asyncio.Semaphore` - probe endpoints (`/api/tags`, `/api/show`) aren't
-subject to it and read the configured mapping directly. Only the chat
-path is gated. If a client disconnects, a tracked background worker keeps the
-permit until Hailo finishes. If an accepted request ends with an ambiguous
-transport failure, the adapter returns `503` for later chat calls. Confirm that
-Hailo is idle (restart Hailo-Ollama if necessary), then restart the adapter to
-clear that quarantine. Connection-establishment failures happen before Hailo
-accepts work, so they do not quarantine the adapter.
+The queue rejects excess requests with `503`; the backend reports initialization
+or native-generation failures at `/readyz`. Model discovery remains available
+while inference runs.
 
 ---
 
@@ -405,11 +371,11 @@ accepts work, so they do not quarantine the adapter.
 the public ID and exact validated HEF filename, and that the HEF file exists.
 Then `POST /api/tags/refresh` on the adapter.
 
-**`peer closed connection without sending complete message body`** -
-Hailo's internal generation timeout fired (around 13 seconds with heavy
-context). Reduce `MAX_HISTORY_TURNS` or switch to a smaller/faster model.
-The adapter quarantines chat traffic after this ambiguous in-flight failure;
-confirm Hailo is idle, then restart the adapter.
+**`/readyz` returns `503`** - Check the adapter log for a HailoRT/Hailo Apps
+initialization or generation failure, verify `HAILO_MODELS` points to an
+existing supported HEF, and check `HAILO_QUEUE_SIZE` is at least 1. Restart
+the adapter after correcting the failure; hardware inference is not retried
+automatically.
 
 **`[Bootstrap pending]` scaffolding keeps appearing in replies** - Delete
 `~/.openclaw/workspace/BOOTSTRAP.md` after onboarding. OpenClaw treats
@@ -465,9 +431,8 @@ MIT - see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- [Hailo](https://hailo.ai/) for the Hailo-10H accelerator and
-  Hailo-Ollama runtime
+- [Hailo](https://hailo.ai/) for the Hailo-10H accelerator, HailoRT, and
+  Hailo Apps runtime
 - [OpenClaw](https://openclaw.ai/) for the local-first agent framework
-- [FastAPI](https://fastapi.tiangolo.com/),
-  [httpx](https://www.python-httpx.org/), and
+- [FastAPI](https://fastapi.tiangolo.com/) and
   [uvicorn](https://www.uvicorn.org/) for the HTTP stack

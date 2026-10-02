@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import uvicorn
 
@@ -10,7 +11,7 @@ import uvicorn
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hailo-ollama-adapter",
-        description="Hailo-Ollama to OpenClaw adapter server.",
+        description="Direct HailoRT server for Ollama- and OpenAI-compatible APIs.",
     )
     parser.add_argument(
         "--host",
@@ -33,7 +34,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit-concurrency",
         type=int,
         default=2,
-        help="Max concurrent HTTP connections (default: 2).",
+        help="Max concurrent HTTP connections; inference remains serialized (default: 2).",
+    )
+    parser.add_argument(
+        "--queue-size",
+        type=int,
+        default=None,
+        help="Waiting inference requests (default: HAILO_QUEUE_SIZE or 1).",
     )
     parser.add_argument(
         "--log-level",
@@ -50,7 +57,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
+    if args.queue_size is not None and args.queue_size < 1:
+        parser.error("--queue-size must be at least 1")
+    if args.queue_size is not None:
+        os.environ["HAILO_QUEUE_SIZE"] = str(args.queue_size)
     uvicorn.run(
         "hailo_ollama_adapter.adapter:app",
         host=args.host,
