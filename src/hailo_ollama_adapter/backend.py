@@ -34,6 +34,7 @@ class _InferenceRequest:
     messages: list[dict[str, Any]]
     generation: dict[str, Any]
     tools: list[dict[str, Any]] | None
+    tool_choice: str
     result: asyncio.Future[str]
 
 
@@ -118,6 +119,7 @@ class NativeHailoBackend:
         messages: list[dict[str, Any]],
         generation: dict[str, Any],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> str:
         """Queue generation without letting caller cancellation release ownership."""
         if self._state != "ready" or self._queue is None:
@@ -125,7 +127,14 @@ class NativeHailoBackend:
         loop = asyncio.get_running_loop()
         result: asyncio.Future[str] = loop.create_future()
         result.add_done_callback(_consume_future_exception)
-        job = _InferenceRequest(hef_path, messages, generation, tools, result)
+        job = _InferenceRequest(
+            hef_path,
+            messages,
+            generation,
+            tools,
+            tool_choice,
+            result,
+        )
         try:
             self._queue.put_nowait(job)
         except asyncio.QueueFull as exc:
@@ -188,7 +197,7 @@ class NativeHailoBackend:
             prompt.append(native_message)
 
         arguments = dict(job.generation)
-        if job.tools is not None:
+        if job.tools is not None and job.tool_choice == "auto":
             arguments["tools"] = job.tools
         result = llm.generate_all(prompt=prompt, **arguments)
         if not isinstance(result, str):

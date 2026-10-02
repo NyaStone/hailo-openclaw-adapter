@@ -192,7 +192,7 @@ def _ollama_full_response(content: str, model: str) -> dict:
 def _build_inference_request(
     request_data: dict,
     default_stream: bool,
-) -> tuple[dict, list[dict], dict, list[dict] | None, bool, str]:
+) -> tuple[dict, list[dict], dict, list[dict] | None, str, bool, str]:
     if not isinstance(request_data, dict):
         raise HTTPException(status_code=400, detail="A JSON object is required")
     is_stream = request_data.get("stream", default_stream)
@@ -210,11 +210,18 @@ def _build_inference_request(
         raise HTTPException(status_code=400, detail="tools must be a list")
     if tools is not None:
         tools = _deep_sanitize(tools)
+    tool_choice = request_data.get("tool_choice", "auto")
+    if not isinstance(tool_choice, str) or tool_choice not in ("auto", "none"):
+        raise HTTPException(
+            status_code=400,
+            detail="tool_choice must be 'auto' or 'none' for this backend",
+        )
     return (
         model,
         messages,
         _generation_options(request_data),
         tools,
+        tool_choice,
         is_stream,
         public_model_id,
     )
@@ -372,6 +379,7 @@ async def chat_completions(request: Request) -> Any:
             messages,
             generation,
             tools,
+            tool_choice,
             is_stream,
             model,
         ) = _build_inference_request(
@@ -379,16 +387,13 @@ async def chat_completions(request: Request) -> Any:
             default_stream=False,
         )
         backend = _get_backend()
-        if tools is None:
-            content = await backend.generate(
-                native_model["hef_path"],
-                messages,
-                generation,
-            )
-        else:
-            content = await backend.generate(
-                native_model["hef_path"], messages, generation, tools=tools,
-            )
+        content = await backend.generate(
+            native_model["hef_path"],
+            messages,
+            generation,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         if is_stream:
             return StreamingResponse(
                 _stream_openai(content, model), media_type="text/event-stream",
@@ -507,6 +512,7 @@ async def api_chat(request: Request) -> Any:
             messages,
             generation,
             tools,
+            tool_choice,
             is_stream,
             model,
         ) = _build_inference_request(
@@ -514,16 +520,13 @@ async def api_chat(request: Request) -> Any:
             default_stream=True,
         )
         backend = _get_backend()
-        if tools is None:
-            content = await backend.generate(
-                native_model["hef_path"],
-                messages,
-                generation,
-            )
-        else:
-            content = await backend.generate(
-                native_model["hef_path"], messages, generation, tools=tools,
-            )
+        content = await backend.generate(
+            native_model["hef_path"],
+            messages,
+            generation,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         if is_stream:
             return StreamingResponse(
                 _stream_ollama(content, model), media_type="application/x-ndjson",
