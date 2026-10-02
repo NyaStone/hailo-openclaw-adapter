@@ -581,6 +581,80 @@ async def test_discovery_lists_only_configured_usable_hefs(
     assert details.json()["capabilities"] == ["completion", "tools"]
 
 
+def test_discovery_uses_installed_hailo_apps_agent_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Catalog-Model.hef"
+    hef_path.touch()
+    monkeypatch.delenv("HAILO_MODELS", raising=False)
+    monkeypatch.setattr(
+        adapter,
+        "_hailo_apps_model_catalog",
+        lambda: [{"name": "Catalog-Model", "hef_path": str(hef_path)}],
+    )
+
+    models = adapter._configured_models()
+
+    assert models == [{
+        "name": "Catalog-Model",
+        "model": "Catalog-Model",
+        "modified_at": models[0]["modified_at"],
+        "size": 0,
+        "digest": "",
+        "details": {"format": "hef"},
+        "capabilities": ["completion", "tools"],
+        "hef_path": str(hef_path),
+    }]
+
+
+def test_discovery_errors_when_no_installed_hef_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HAILO_MODELS", raising=False)
+    monkeypatch.setattr(adapter, "_hailo_apps_model_catalog", lambda: [])
+
+    with pytest.raises(RuntimeError, match="No installed LLM HEFs"):
+        adapter._configured_models()
+
+
+@pytest.mark.asyncio
+async def test_api_show_reports_loaded_hef_context_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Catalog-Model.hef"
+    hef_path.touch()
+    monkeypatch.delenv("HAILO_MODELS", raising=False)
+    monkeypatch.setattr(
+        adapter,
+        "_hailo_apps_model_catalog",
+        lambda: [{"name": "Catalog-Model", "hef_path": str(hef_path)}],
+    )
+
+    def initialize(backend: NativeHailoBackend, model_paths: list[str]) -> None:
+        native_llm = FakeNativeLLM(capacity=4096)
+        backend._models = dict.fromkeys(model_paths, native_llm)
+        backend._model_context_lengths = dict.fromkeys(model_paths, 4096)
+
+    monkeypatch.setattr(NativeHailoBackend, "_initialize", initialize)
+    monkeypatch.delattr(adapter.app.state, "inference_backend", raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with adapter._lifespan(adapter.app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://adapter",
+        ) as client:
+            response = await client.post(
+                "/api/show",
+                json={"model": "Catalog-Model"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["model_info"] == {"hailo.context_length": 4096}
+
+
 @pytest.mark.asyncio
 async def test_discovery_omits_unusable_hefs_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
