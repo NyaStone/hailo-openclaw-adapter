@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: Expose configured model discovery; 03: Preserve conversations through the public APIs.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] The configured public model ID selects its mapped HEF and native generation returns a text response through both public APIs.
 - [ ] Native imports remain lazy for fake-backend protocol use; resources initialize and release through application lifespan.

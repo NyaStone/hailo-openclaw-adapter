@@ -32,6 +32,27 @@ class ErrorPostingAsyncClient:
         )
 
 
+class FakeInferenceBackend:
+    """Record public API inference requests without native Hailo imports."""
+
+    def __init__(self, response: str = "Hailo says hello.") -> None:
+        self.response = response
+        self.requests: list[dict[str, Any]] = []
+
+    async def generate(
+        self,
+        hef_path: str,
+        messages: list[dict[str, Any]],
+        generation: dict[str, Any],
+    ) -> str:
+        self.requests.append({
+            "hef_path": hef_path,
+            "messages": messages,
+            "generation": generation,
+        })
+        return self.response
+
+
 def upstream_status_error(
     status_code: int,
     payload: dict[str, str],
@@ -50,6 +71,53 @@ def test_flatten_newlines_preserves_words_without_literal_line_breaks() -> None:
     assert adapter._flatten_newlines("alpha\r\nbeta\ngamma\rdelta") == (
         "alpha beta gamma delta"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/api/chat", {"message": {"role": "assistant", "content": "Hailo says hello."}}),
+        ("/v1/chat/completions", {"choices": [{"message": {"role": "assistant", "content": "Hailo says hello."}}]}),
+    ],
+)
+async def test_public_routes_generate_text_with_mapped_hef(
+    path: str,
+    expected: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "public-id",
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "stream": False,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    if path == "/api/chat":
+        assert payload["message"] == expected["message"]
+    else:
+        assert payload["choices"] == expected["choices"]
+    assert backend.requests == [{
+        "hef_path": str(hef_path),
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "generation": {},
+    }]
 
 
 @pytest.mark.asyncio
