@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -107,6 +108,91 @@ async def test_refresh_uses_native_api_tags(monkeypatch: pytest.MonkeyPatch) -> 
         "qwen3:1.7b",
         "qwen2.5-coder:1.5b",
     ]
+
+
+@pytest.mark.asyncio
+async def test_discovery_lists_only_configured_usable_hefs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        tags = await client.get("/api/tags")
+        details = await client.post("/api/show", json={"model": "coder:1.5b"})
+
+    assert [model["name"] for model in tags.json()["models"]] == ["coder:1.5b"]
+    assert details.json()["details"]["format"] == "hef"
+    assert details.json()["model_info"]["qwen2.context_length"] == 2048
+    assert details.json()["capabilities"] == ["completion", "tools"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_omits_unusable_hefs_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    missing_hef = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(missing_hef)}))
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.get("/api/tags")
+
+    assert response.json() == {"models": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_unknown_chat_model_is_rejected_before_upstream_call(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
+
+    async def unexpected_post(_body: bytes) -> dict[str, Any]:
+        raise AssertionError("unknown model must be rejected before inference")
+
+    monkeypatch.setattr(adapter, "_post_hailo", unexpected_post)
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.post(
+            path,
+            json={"model": "unknown", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_discovery_does_not_wait_for_inference_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
+    await adapter._hailo_semaphore.acquire()
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://adapter",
+            timeout=1,
+        ) as client:
+            response = await client.get("/api/tags")
+    finally:
+        adapter._hailo_semaphore.release()
+
+    assert response.status_code == 200
+    assert response.json()["models"][0]["name"] == "coder:1.5b"
 
 
 @pytest.mark.asyncio
