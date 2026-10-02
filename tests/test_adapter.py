@@ -91,7 +91,11 @@ class FakeNativeCompletion:
 
 
 class FakeNativeLLM:
-    def __init__(self, capacity: int = 10000, status_name: str = "LOGICAL_END_OF_GENERATION") -> None:
+    def __init__(
+        self,
+        capacity: int = 10000,
+        status_name: str = "LOGICAL_END_OF_GENERATION",
+    ) -> None:
         self.capacity = capacity
         self.status_name = status_name
         self.tokenized_prompt = ""
@@ -110,7 +114,11 @@ class FakeNativeLLM:
     def max_context_capacity(self) -> int:
         return self.capacity
 
-    def generate(self, prompt: list[dict[str, Any]], **arguments: Any) -> FakeNativeCompletion:
+    def generate(
+        self,
+        prompt: list[dict[str, Any]],
+        **arguments: Any,
+    ) -> FakeNativeCompletion:
         self.generate_calls.append({"prompt": prompt, "arguments": arguments})
         return FakeNativeCompletion("Native response.", self.status_name)
 
@@ -124,7 +132,7 @@ async def _start_fake_native_backend(
     native_llm: FakeNativeLLM,
 ) -> NativeHailoBackend:
     def initialize(backend: NativeHailoBackend, model_paths: list[str]) -> None:
-        backend._models = {path: native_llm for path in model_paths}
+        backend._models = dict.fromkeys(model_paths, native_llm)
 
     monkeypatch.setattr(NativeHailoBackend, "_initialize", initialize)
     backend = NativeHailoBackend()
