@@ -9,7 +9,6 @@ newline-in-content rejection, and system-role-on-continuation rejection.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -47,7 +46,10 @@ logger = logging.getLogger(__name__)
 async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
     backend = getattr(application.state, "inference_backend", None)
     if backend is None:
-        queue_size = int(os.environ.get("HAILO_QUEUE_SIZE", "1"))
+        try:
+            queue_size = int(os.environ.get("HAILO_QUEUE_SIZE", "1"))
+        except ValueError:
+            queue_size = 0
         backend = NativeHailoBackend(queue_size=queue_size)
         application.state.inference_backend = backend
     await backend.start(_configured_models())
@@ -378,12 +380,24 @@ async def _stream_ollama(content: str, model: str) -> AsyncIterator[str]:
 async def chat_completions(request: Request) -> Any:
     """Serve OpenAI chat completions, defaulting requests to non-streaming."""
     try:
-        native_model, messages, generation, tools, is_stream, model = _build_inference_request(
-            await request.json(), default_stream=False,
+        (
+            native_model,
+            messages,
+            generation,
+            tools,
+            is_stream,
+            model,
+        ) = _build_inference_request(
+            await request.json(),
+            default_stream=False,
         )
         backend = _get_backend()
         if tools is None:
-            content = await backend.generate(native_model["hef_path"], messages, generation)
+            content = await backend.generate(
+                native_model["hef_path"],
+                messages,
+                generation,
+            )
         else:
             content = await backend.generate(
                 native_model["hef_path"], messages, generation, tools=tools,
@@ -501,12 +515,24 @@ async def api_show(request: Request) -> dict:
 async def api_chat(request: Request) -> Any:
     """ Serve Ollama chat requests, defaulting to NDJSON streaming."""
     try:
-        native_model, messages, generation, tools, is_stream, model = _build_inference_request(
-            await request.json(), default_stream=True,
+        (
+            native_model,
+            messages,
+            generation,
+            tools,
+            is_stream,
+            model,
+        ) = _build_inference_request(
+            await request.json(),
+            default_stream=True,
         )
         backend = _get_backend()
         if tools is None:
-            content = await backend.generate(native_model["hef_path"], messages, generation)
+            content = await backend.generate(
+                native_model["hef_path"],
+                messages,
+                generation,
+            )
         else:
             content = await backend.generate(
                 native_model["hef_path"], messages, generation, tools=tools,

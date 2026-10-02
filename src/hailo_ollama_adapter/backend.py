@@ -41,9 +41,12 @@ class NativeHailoBackend:
     """Own Hailo resources and execute all native calls on one worker thread."""
 
     def __init__(self, queue_size: int = 1, request_timeout: float = 180.0) -> None:
-        if queue_size < 1:
-            raise ValueError("queue_size must be at least 1")
         self._queue_size = queue_size
+        self._configuration_error = (
+            "HAILO_QUEUE_SIZE must be an integer greater than or equal to 1"
+            if queue_size < 1
+            else None
+        )
         self._request_timeout = request_timeout
         self._state = "stopped"
         self._error: str | None = None
@@ -65,6 +68,10 @@ class NativeHailoBackend:
     async def start(self, models: Sequence[dict[str, Any]]) -> None:
         """Initialize the device and configured models during app startup."""
         if self._state != "stopped":
+            return
+        if self._configuration_error is not None:
+            self._state = "failed"
+            self._error = self._configuration_error
             return
         model_paths = sorted({model["hef_path"] for model in models})
         if not model_paths:
@@ -245,7 +252,9 @@ class NativeHailoBackend:
                 errors.append(exc)
             self._vdevice = None
         if errors:
-            raise RuntimeError("One or more Hailo resources failed to release") from errors[0]
+            raise RuntimeError(
+                "One or more Hailo resources failed to release"
+            ) from errors[0]
 
 
 def _consume_future_exception(future: asyncio.Future[Any]) -> None:
