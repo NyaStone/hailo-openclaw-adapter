@@ -135,21 +135,22 @@ pnpm approve-builds -g
 
 ## Installation
 
-Inside a Python 3.10+ virtualenv or existing SW Bundle hailo_venv can be used (DFC packages conflicts exists):
+Install the adapter into the Hailo Apps virtual environment so its HailoRT
+bindings remain available:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+cd ~/hailo-apps
+source venv_hailo_apps/bin/activate
 
-pip3 install git+https://github.com/tishyk/hailo-ollama-openclaw-adapter.git
+python -m pip install git+https://github.com/tishyk/hailo-ollama-openclaw-adapter.git
 ```
 
-This installs the `hailo-ollama-adapter` command into your venv.
+This installs the `hailo-ollama-adapter` command into that environment.
 
 For a specific release:
 
 ```bash
-pip3 install git+https://github.com/tishyk/hailo-ollama-openclaw-adapter.git@2026.04.20
+python -m pip install git+https://github.com/tishyk/hailo-ollama-openclaw-adapter.git@2026.04.20
 ```
 
 ### Clone for development
@@ -160,13 +161,12 @@ If you want to modify the adapter or run tests:
 git clone https://github.com/tishyk/hailo-ollama-openclaw-adapter.git
 cd hailo-ollama-openclaw-adapter
 
-python3 -m venv venv
-source venv/bin/activate
-pip3 install -e ".[dev]"
+source ~/hailo-apps/venv_hailo_apps/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
 `-e` is editable mode - code changes take effect without reinstall.
-`[dev]` pulls in `ruff`, `pytest`, and `pytest-asyncio` for local testing.
+`[dev]` adds `ruff`, `pytest`, `pytest-asyncio`, and `httpx` for tests.
 
 ---
 
@@ -186,7 +186,7 @@ Set `HAILO_MODELS` and `HAILO_QUEUE_SIZE`, then run any of these (they're all
 equivalent):
 
 ```bash
-source venv/bin/activate
+source ~/hailo-apps/venv_hailo_apps/bin/activate
 
 # Simplest
 hailo-ollama-adapter
