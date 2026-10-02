@@ -14,7 +14,7 @@
 - [x] Record the candidate model, tested inputs/results, context capacity, completion status, and generator cleanup observations, including unavailable/unknown values.
 - [x] Run adapter project code only from a committed feature-branch revision synced to `home`.
 
-## Findings
+## Answer
 
 Target-HEF prompt/tool validation completed on `home` using the installed Qwen2.5-Coder HEF. No real tool was executed.
 
