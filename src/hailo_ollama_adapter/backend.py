@@ -136,7 +136,11 @@ class NativeHailoBackend:
         try:
             for path in model_paths:
                 llm = LLM(self._vdevice, path)
-                capacity = int(llm.max_context_capacity())
+                try:
+                    capacity = int(llm.max_context_capacity())
+                except Exception:
+                    llm.release()
+                    raise
                 if capacity < 1:
                     llm.release()
                     raise RuntimeError(f"HEF reported invalid context capacity: {path}")

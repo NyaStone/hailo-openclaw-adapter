@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -124,6 +126,27 @@ class FakeNativeLLM:
 
     def release(self) -> None:
         return None
+
+
+@pytest.fixture(autouse=True)
+def mock_hailo_apps_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    def catalog() -> list[dict[str, str]]:
+        try:
+            mapping = json.loads(os.environ.get("HAILO_MODELS", "{}"))
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(mapping, dict):
+            return []
+        return [
+            {
+                "name": Path(raw_path).name.removesuffix(".hef"),
+                "hef_path": str(Path(raw_path).resolve()),
+            }
+            for raw_path in mapping.values()
+            if isinstance(raw_path, str)
+        ]
+
+    monkeypatch.setattr(adapter, "_hailo_apps_model_catalog", catalog)
 
 
 async def _start_fake_native_backend(

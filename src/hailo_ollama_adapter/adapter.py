@@ -655,6 +655,12 @@ def _configured_models() -> list[dict]:
             logger.warning("Ignoring HEF not listed by Hailo Apps agent: %s", path)
             continue
         try:
+            if path.resolve() != Path(catalog_model["hef_path"]).resolve():
+                logger.warning("Ignoring HEF path not resolved by Hailo Apps: %s", path)
+                continue
+        except OSError:
+            continue
+        try:
             file_stat = path.stat()
         except OSError:
             continue
@@ -847,7 +853,7 @@ async def api_tags() -> dict:
 
 @app.post("/api/tags/refresh")
 async def api_tags_refresh() -> dict:
-    """Re-read configured model paths and report the usable entries."""
+    """Re-report models loaded during application startup."""
     models = [_ollama_model_info(model) for model in await _get_models()]
     return {"models": models, "refreshed": True}
 

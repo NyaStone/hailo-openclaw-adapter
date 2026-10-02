@@ -26,7 +26,7 @@ OS (Debian 13 "Trixie")**. Requires **Python 3.10 or newer**.
 
 OpenClaw talks to language-model providers using the Ollama or OpenAI
 wire protocols. This adapter serves those protocols on port 11435 and maps
-the public model ID to an existing, validated HEF:
+public model IDs to installed HEFs from the Hailo Apps `agent` catalog:
 
 - OpenClaw -> adapter (standard Ollama `/api/tags`, `/api/show`, `/api/chat`)
 - adapter -> HailoRT GenAI (structured conversation and generation options)
@@ -42,9 +42,12 @@ The adapter keeps model discovery and protocol handling separate from the
 serialized native inference worker. Native Hailo imports are lazy, so fake
 backends can exercise the HTTP API without an accelerator runtime installed.
 
-- **Explicit model discovery.** Only public IDs mapped to existing HEFs with
-  validated profiles are listed. Unknown IDs are rejected, with no fabricated
-  fallback model; discovery probes do not acquire the inference slot.
+- **Framework model discovery.** Installed LLM HEFs come from Hailo Apps'
+  `agent` catalog; no model is downloaded implicitly. An empty usable catalog
+  fails application startup, and unknown public IDs are rejected.
+- **HEF-derived limits.** `/api/show` reports the loaded HEF's native
+  `LLM.max_context_capacity()`, not the base model family's advertised context
+  window. Hailo Apps does not provide context limits in its model catalog.
 - **Single-owner inference.** Blocking native calls run on one executor thread.
   One request can wait by default; additional work gets a clear busy response.
 - **Disconnect-safe ownership.** Cancelling or timing out an HTTP waiter does
@@ -83,9 +86,10 @@ not installed by this package's ordinary pip dependencies.
 
 ## Before you start
 
-Configure a public ID for the validated HEF before starting the adapter. Chat
-requests use that existing local HEF path; the adapter does not pull models.
-OpenClaw onboarding should happen after the adapter is serving.
+The adapter discovers installed LLM HEFs listed by the Hailo Apps `agent`
+model catalog. It does not download models. By default, each discovered model's
+Hailo Apps name is its public ID; set `HAILO_MODELS` only when you want custom
+public IDs. OpenClaw onboarding should happen after the adapter is serving.
 
 ### 1. Prepare the Hailo Apps runtime
 
@@ -99,11 +103,10 @@ cd ~/hailo-apps
 source venv_hailo_apps/bin/activate
 ```
 
-### 2. Configure a validated HEF
+### 2. Optionally configure public model IDs
 
-Set the environment variable before starting the adapter. The public model ID
-is the name OpenClaw will use; the HEF path must point to an existing
-`Qwen2.5-Coder-1.5B-Instruct.hef` validated on HAILO10H.
+`HAILO_MODELS` optionally maps the public ID OpenClaw uses to an existing HEF
+listed by Hailo Apps' `agent` catalog for the detected architecture:
 
 ```bash
 export HAILO_MODELS='{"qwen2.5-coder:1.5b":"/usr/local/hailo/resources/models/hailo10h/Qwen2.5-Coder-1.5B-Instruct.hef"}'
@@ -181,18 +184,19 @@ python -m pip install -e ".[dev]"
 
 ## Running the adapter
 
-Before starting the adapter, map public model IDs to HEF files with
-`HAILO_MODELS`. The value is a JSON object. Only existing HEFs with a
-validated model profile are exposed; the currently validated profile is
-`Qwen2.5-Coder-1.5B-Instruct.hef` (2,048-token context, completion and tools).
-Mapped models load during application startup and are released at shutdown.
+At startup, the adapter discovers installed LLM HEFs from the Hailo Apps
+`agent` catalog for the connected architecture. It loads those HEFs and reports
+their actual context capacities from HailoRT. Startup fails if there are no
+usable installed HEFs. `HAILO_MODELS` is optional and can map custom public IDs
+to paths for cataloged HEFs; mapped models load during startup and are released
+at shutdown.
 
 ```bash
 export HAILO_MODELS='{"qwen2.5-coder:1.5b":"/usr/local/hailo/resources/models/hailo10h/Qwen2.5-Coder-1.5B-Instruct.hef"}'
 ```
 
-Set `HAILO_MODELS` and `HAILO_QUEUE_SIZE`, then run any of these (they're all
-equivalent):
+Set `HAILO_MODELS` only if custom public IDs are needed. Set
+`HAILO_QUEUE_SIZE` if desired, then run any of these (they're all equivalent):
 
 ```bash
 source ~/hailo-apps/venv_hailo_apps/bin/activate
@@ -231,16 +235,18 @@ hailo-ollama-adapter --help
 In a second terminal:
 
 ```bash
-# Should list the configured, usable HEF profiles
+# Should list installed HEFs from the Hailo Apps agent catalog
 curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
 
 # Native device/model initialization must succeed for readiness
 curl -i http://127.0.0.1:11435/readyz
 ```
 
-The model ID on the left is what OpenClaw sees and must send on chat requests.
-There is no implicit default model or fallback listing. `/api/tags/refresh`
-re-reads the configured mapping and checks the HEF files again:
+When `HAILO_MODELS` is set, the ID on the left is what OpenClaw sees and must
+send on chat requests. Without it, model IDs are the Hailo Apps catalog names.
+Only installed models listed for the Hailo Apps `agent` app are exposed.
+`/api/tags/refresh` re-reports the models loaded at startup; restart after
+installing another HEF:
 
 ```bash
 curl -s -X POST http://127.0.0.1:11435/api/tags/refresh
@@ -253,7 +259,7 @@ curl -s -X POST http://127.0.0.1:11435/api/tags/refresh
 Before running onboarding, make sure:
 
 - The adapter is running inside the Hailo Apps virtual environment
-- `HAILO_MODELS` maps the public ID to the validated HEF
+- `HAILO_MODELS` maps a custom public ID to a cataloged installed HEF (optional)
 - `GET /readyz` returns `200`
 
 Open a **second terminal** and run OpenClaw's interactive onboarding.
@@ -285,7 +291,7 @@ Arrow down to **Ollama (Cloud and local open models)** and hit Enter.
 
 - **Ollama mode**: `Local only`
 - **Ollama base URL**: `http://127.0.0.1:11435` (the adapter)
-- **Default model**: pick one of the public IDs configured in `HAILO_MODELS`.
+- **Default model**: pick a discovered Hailo Apps model ID.
 
 <p align="center">
   <img src="docs/images/setup-model-picker.jpg" alt="Model picker with live Hailo models" width="900">
@@ -312,7 +318,8 @@ openclaw dashboard
 ### Step 5 - Chat with your Hailo-accelerated model
 
 The dashboard opens in your browser. Start chatting with the public model ID
-you configured; the current validated profile is Qwen2.5-Coder-1.5B on HAILO10H.
+you configured, or the discovered Hailo Apps model name when no override was
+configured.
 
 <p align="center">
   <img src="docs/images/openclaw-dashboard.jpg" alt="OpenClaw dashboard in action" width="900">
@@ -340,8 +347,8 @@ Press `Ctrl+C` in the adapter terminal when you're done.
 
 | Method | Path                              | Purpose                                    |
 |--------|-----------------------------------|--------------------------------------------|
-| GET    | `/api/tags`                       | Configured, usable HEF model list          |
-| POST   | `/api/tags/refresh`               | Recheck configured HEF paths               |
+| GET    | `/api/tags`                       | Installed Hailo Apps agent HEF list        |
+| POST   | `/api/tags/refresh`               | Re-list HEFs loaded at startup             |
 | POST   | `/api/show`                       | Ollama model details                       |
 | GET    | `/readyz`                         | Native backend readiness                   |
 | POST   | `/api/chat`                       | Ollama chat endpoint                       |
@@ -357,8 +364,9 @@ the public ID in client-facing responses.
 
 ## Configuration knobs
 
-Configure public IDs to HEF paths with `HAILO_MODELS`. `HAILO_QUEUE_SIZE`
-controls how many requests may wait behind the active generation (default 1).
+Optionally map custom public IDs to cataloged HEF paths with `HAILO_MODELS`.
+`HAILO_QUEUE_SIZE` controls how many requests may wait behind the active
+generation (default 1).
 Inference itself is always serialized because the Hailo device and model
 context have one owner. Request deadlines are 180 seconds; a timed-out client
 does not cancel native work or make the device available early.
@@ -376,13 +384,15 @@ while inference runs.
 
 ## Troubleshooting
 
-**OpenClaw dashboard shows no models** - Check that `HAILO_MODELS` contains
-the public ID and exact validated HEF filename, and that the HEF file exists.
-Then `POST /api/tags/refresh` on the adapter.
+**OpenClaw dashboard shows no models** - Check that Hailo Apps detects the
+connected architecture, that the model is listed for its `agent` app, and that
+the corresponding HEF exists in the Hailo Apps resources directory. If
+`HAILO_MODELS` is set, confirm it points to an installed cataloged HEF. Restart
+the adapter after correcting the catalog or installing the model.
 
 **`/readyz` returns `503`** - Check the adapter log for a HailoRT/Hailo Apps
-initialization or generation failure, verify `HAILO_MODELS` points to an
-existing supported HEF, and check `HAILO_QUEUE_SIZE` is at least 1. Restart
+initialization or generation failure, verify the Hailo Apps catalog contains
+an installed LLM HEF and check `HAILO_QUEUE_SIZE` is at least 1. Restart
 the adapter after correcting the failure; hardware inference is not retried
 automatically.
 
