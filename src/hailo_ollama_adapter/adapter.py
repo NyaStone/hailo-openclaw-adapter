@@ -361,14 +361,14 @@ def _xml_value(element: ET.Element) -> Any:
     text = (element.text or "").strip()
     try:
         return json.loads(text)
-    except json.JSONDecodeError as json_error:
+    except json.JSONDecodeError:
         return text
 
 
 def _parse_tool_payload(payload: str) -> dict[str, Any]:
     try:
         call = json.loads(payload)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as json_error:
         try:
             root = ET.fromstring(f"<root>{payload}</root>")
         except ET.ParseError as exc:
