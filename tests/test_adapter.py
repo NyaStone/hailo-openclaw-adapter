@@ -552,8 +552,8 @@ async def test_public_routes_return_validated_tool_calls(
         response=(
             'Checking now. <tool_call>{"name":"lookup_weather",'
             '"arguments":{"city":"Testville"}}</tool_call>'
-            '<tool_call>{"name":"lookup_time",'
-            '"arguments":{"timezone":"UTC"}}</tool_call>'
+            "<tool_call><name>lookup_time</name><arguments>"
+            "<timezone>UTC</timezone></arguments></tool_call>"
         ),
     )
     monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
