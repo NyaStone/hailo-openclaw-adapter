@@ -56,8 +56,9 @@ around Hailo Model Zoo GenAI 5.3.0 and the OpenClaw 2026.4.x series:
   conversation continuations all became hard errors rather than being
   silently tolerated. The old adapter had no sanitization for any of
   these because they hadn't mattered on 5.1.x / 5.2.x.
-- **Dynamic model discovery.** This version queries `/api/tags` at startup,
-  caches the result, and exposes the full set during the openclaw model setup.
+- **Explicit model discovery.** Only public IDs mapped to existing HEFs with
+  validated profiles are listed. Unknown IDs are rejected, with no fabricated
+  fallback model; discovery probes do not acquire the inference slot.
 - **Backpressure handled at the app layer.** The old adapter relied on
   uvicorn's `--limit-concurrency` for backpressure, which 503'd probe
   endpoints during OpenClaw's startup burst of `/api/show` calls. This
@@ -213,8 +214,17 @@ pip3 install -e ".[dev]"
 
 ## Running the adapter
 
-Check hailo-ollama server is up and running. 
-Open a terminal and run any of these (they're all equivalent):
+Before starting the adapter, map public model IDs to HEF files with
+`HAILO_MODELS`. The value is a JSON object. Only existing HEFs with a
+validated model profile are exposed; the currently validated profile is
+`Qwen2.5-Coder-1.5B-Instruct.hef` (2,048-token context, completion and tools).
+
+```bash
+export HAILO_MODELS='{"qwen2.5-coder:1.5b":"/usr/local/hailo/resources/models/hailo10h/Qwen2.5-Coder-1.5B-Instruct.hef"}'
+```
+
+Check that the Hailo-Ollama server is running, then run any of these
+(they're all equivalent):
 
 ```bash
 source venv/bin/activate
@@ -252,18 +262,8 @@ hailo-ollama-adapter --help
 In a second terminal:
 
 ```bash
-# Should list the models your Hailo-Ollama has pulled
+# Should list the configured, usable HEF profiles
 curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
-```
-
-Before starting the adapter, map public model IDs to HEF files with
-`HAILO_MODELS`. The value is a JSON object. Only existing HEFs with a
-validated model profile are exposed; the currently validated profile is
-`Qwen2.5-Coder-1.5B-Instruct.hef` (2,048-token context, completion and tools).
-
-```bash
-export HAILO_MODELS='{"qwen2.5-coder:1.5b":"/usr/local/hailo/resources/models/hailo10h/Qwen2.5-Coder-1.5B-Instruct.hef"}'
-hailo-ollama-adapter
 ```
 
 The model ID on the left is what OpenClaw sees and must send on chat requests.
@@ -314,9 +314,7 @@ Arrow down to **Ollama (Cloud and local open models)** and hit Enter.
 - **Ollama mode**: `Local only`
 - **Ollama base URL**: `http://127.0.0.1:11435` (the **adapter**, not
   Hailo-Ollama directly - adapter runs on 11435, Hailo on 8000)
-- **Default model**: pick any model from the list. This list is fetched
-  live from Hailo-Ollama through the adapter. `qwen3:1.7b` is a sensible
-  starter.
+- **Default model**: pick one of the public IDs configured in `HAILO_MODELS`.
 
 <p align="center">
   <img src="docs/images/setup-model-picker.jpg" alt="Model picker with live Hailo models" width="900">
@@ -425,9 +423,9 @@ accepts work, so they do not quarantine the adapter.
 started before Hailo-Ollama was ready. Either start Hailo-Ollama first
 or `POST /api/tags/refresh` once Hailo is up.
 
-**OpenClaw dashboard shows only one model** - The adapter is serving its
-fallback. Check `curl http://127.0.0.1:8000/api/tags` returns your
-pulled models, then `POST /api/tags/refresh` on the adapter.
+**OpenClaw dashboard shows no models** - Check that `HAILO_MODELS` contains
+the public ID and exact validated HEF filename, and that the HEF file exists.
+Then `POST /api/tags/refresh` on the adapter.
 
 **`peer closed connection without sending complete message body`** -
 Hailo's internal generation timeout fired (around 13 seconds with heavy

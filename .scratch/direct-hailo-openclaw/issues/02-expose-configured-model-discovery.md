@@ -4,10 +4,10 @@
 
 **Blocked by:** 01: Validate the target HEF contract on home.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Configure explicit public model IDs mapped to usable HEFs; chat requests do not download or pull models implicitly.
-- [ ] Model listing includes only configured usable models, with no fabricated fallback entries.
-- [ ] Model detail responses report truthful model format, context capacity, and only validated capabilities.
-- [ ] Unknown model IDs return a not-found error instead of silently selecting another model.
-- [ ] Discovery probes remain responsive while inference is active.
+- [x] Configure explicit public model IDs mapped to usable HEFs; chat requests do not download or pull models implicitly.
+- [x] Model listing includes only configured usable models, with no fabricated fallback entries.
+- [x] Model detail responses report truthful model format, context capacity, and only validated capabilities.
+- [x] Unknown model IDs return a not-found error instead of silently selecting another model.
+- [x] Discovery probes remain responsive while inference is active.
