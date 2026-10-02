@@ -8,7 +8,7 @@
 
 ## Decisions-so-far
 
-- [Issue 01](issues/01-validate-target-hef-contract.md): stop before inference rather than download an uncached HEF. Prompt behavior, tool capability, context capacity, and generator cleanup remain unvalidated.
+- [Issue 01](issues/01-validate-target-hef-contract.md): validation is paused rather than downloading an uncached HEF. Prompt behavior, tool capability, context capacity, and generator cleanup remain unvalidated pending operator setup.
 
 ## Fog
 
