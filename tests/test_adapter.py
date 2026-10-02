@@ -1,7 +1,8 @@
-"""Correctness tests for model discovery and upstream HTTP errors."""
+"""Public API tests for model discovery and direct inference behavior."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -60,15 +61,11 @@ class FakeInferenceBackend:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("path", "expected"),
-    [
-        ("/api/chat", {"message": {"role": "assistant", "content": "Hailo says hello."}}),
-        ("/v1/chat/completions", {"choices": [{"index": 0, "message": {"role": "assistant", "content": "Hailo says hello."}, "finish_reason": "stop"}]}),
-    ],
+    "path",
+    ["/api/chat", "/v1/chat/completions"],
 )
 async def test_public_routes_generate_text_with_mapped_hef(
     path: str,
-    expected: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
@@ -95,9 +92,16 @@ async def test_public_routes_generate_text_with_mapped_hef(
     assert response.status_code == 200
     payload = response.json()
     if path == "/api/chat":
-        assert payload["message"] == expected["message"]
+        assert payload["message"] == {
+            "role": "assistant",
+            "content": "Hailo says hello.",
+        }
     else:
-        assert payload["choices"] == expected["choices"]
+        assert payload["choices"] == [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hailo says hello."},
+            "finish_reason": "stop",
+        }]
     assert backend.requests == [{
         "hef_path": str(hef_path),
         "messages": [{"role": "user", "content": "Say hello."}],
@@ -177,14 +181,19 @@ def test_chat_translation_selects_the_configured_local_hef(
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
 
-    model, messages, generation, tools, is_stream, response_model = (
-        adapter._build_inference_request(
+    (
+        model,
+        messages,
+        generation,
+        tools,
+        is_stream,
+        response_model,
+    ) = adapter._build_inference_request(
         {
             "model": "public-id",
             "messages": [{"role": "user", "content": "hello"}],
         },
         default_stream=False,
-        )
     )
 
     assert model["hef_path"] == str(hef_path)
@@ -261,7 +270,7 @@ async def test_discovery_remains_responsive_during_generation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
 @pytest.mark.parametrize(
     ("error", "status_code"),
     [
@@ -281,12 +290,8 @@ async def test_chat_endpoint_reports_backend_state(
     hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
-
-    async def fail_post(_body: bytes) -> dict[str, Any]:
-        """Simulate a non-streaming upstream status failure."""
-        raise upstream_status_error(404, {"error": "model 'missing' not found"})
-
-    monkeypatch.setattr(adapter, "_post_hailo", fail_post)
+    backend = FakeInferenceBackend(error=error)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
     transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
     async with httpx.AsyncClient(
         transport=transport,
@@ -301,8 +306,8 @@ async def test_chat_endpoint_reports_backend_state(
             },
         )
 
-    assert response.status_code == 404
-    assert response.json() == {"error": "model 'missing' not found"}
+    assert response.status_code == status_code
+    assert response.json() == {"error": str(error)}
 
 
 @pytest.mark.asyncio
@@ -315,13 +320,8 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
     hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
-    observed: list[dict[str, Any]] = []
-
-    async def fake_backend(body: bytes) -> dict[str, Any]:
-        observed.append(json.loads(body))
-        return {"message": {"content": "Tool result received."}}
-
-    monkeypatch.setattr(adapter, "_post_hailo", fake_backend)
+    backend = FakeInferenceBackend(response="Tool result received.")
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
     tool_schema = {
         "type": "function",
         "function": {
@@ -394,11 +394,11 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
         response = await client.post(path, json=request_data)
 
     assert response.status_code == 200
-    assert len(observed) == 1
-    assert observed[0]["messages"] == messages
-    assert observed[0]["tools"] == [tool_schema]
-    assert observed[0]["tool_choice"] == "auto"
-    assert observed[0]["generation"] == {
+    assert len(backend.requests) == 1
+    assert backend.requests[0]["messages"] == messages
+    assert backend.requests[0]["tools"] == [tool_schema]
+    assert backend.requests[0]["tool_choice"] == "auto"
+    assert backend.requests[0]["generation"] == {
         "temperature": 0.2,
         "top_p": 0.8,
         "max_generated_tokens": 64,
