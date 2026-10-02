@@ -12,6 +12,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _clean_generated_text(content: str) -> str:
+    return content.replace("<|im_end|>", "")
+
+
 class BackendBusyError(RuntimeError):
     """Raised when the bounded inference queue is full."""
 
@@ -202,7 +206,7 @@ class NativeHailoBackend:
         result = llm.generate_all(prompt=prompt, **arguments)
         if not isinstance(result, str):
             raise TypeError("HailoRT returned a non-text generation result")
-        return result
+        return _clean_generated_text(result)
 
     def _fail_queued(self) -> None:
         assert self._queue is not None

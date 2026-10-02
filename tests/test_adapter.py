@@ -17,6 +17,7 @@ from hailo_ollama_adapter.backend import (
     BackendTimeoutError,
     BackendUnavailableError,
     NativeHailoBackend,
+    _clean_generated_text,
 )
 
 
@@ -67,6 +68,10 @@ class FakeInferenceBackend:
         if self.error is not None:
             raise self.error
         return self.response
+
+
+def test_native_response_removes_qwen_end_marker() -> None:
+    assert _clean_generated_text("A short answer.<|im_end|>") == "A short answer."
 
 
 @pytest.mark.asyncio
