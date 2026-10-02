@@ -206,6 +206,101 @@ async def test_streaming_routes_terminate_with_protocol_marker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_streaming_routes_emit_text_and_each_tool_call_once(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(
+        response=(
+            'Checking now. <tool_call>{"name":"lookup_weather",'
+            '"arguments":{"city":"Testville"}}</tool_call>'
+            '<tool_call>{"name":"lookup_time",'
+            '"arguments":{"timezone":"UTC"}}</tool_call>'
+        ),
+    )
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {argument: {"type": "string"}},
+                    "required": [argument],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        for name, argument in (
+            ("lookup_weather", "city"),
+            ("lookup_time", "timezone"),
+        )
+    ]
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Check weather and time."}],
+                "tools": tools,
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    if path == "/api/chat":
+        records = [json.loads(line) for line in response.text.splitlines()]
+        assert records[-1]["done"] is True
+        assert records[-1]["message"]["content"] == "Checking now."
+        calls = records[-1]["message"]["tool_calls"]
+        assert [call["function"] for call in calls] == [
+            {"name": "lookup_weather", "arguments": {"city": "Testville"}},
+            {"name": "lookup_time", "arguments": {"timezone": "UTC"}},
+        ]
+    else:
+        events = [
+            line[6:]
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert events[-1] == "[DONE]"
+        chunks = [json.loads(event) for event in events[:-1]]
+        assert "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+        ) == "Checking now."
+        call_deltas = [
+            delta
+            for chunk in chunks
+            for delta in chunk["choices"][0]["delta"].get("tool_calls", [])
+        ]
+        assert [call["index"] for call in call_deltas] == [0, 1]
+        assert len({call["id"] for call in call_deltas}) == 2
+        assert all(call["id"].startswith("call_") for call in call_deltas)
+        assert [
+            {
+                "name": call["function"]["name"],
+                "arguments": json.loads(call["function"]["arguments"]),
+            }
+            for call in call_deltas
+        ] == [
+            {"name": "lookup_weather", "arguments": {"city": "Testville"}},
+            {"name": "lookup_time", "arguments": {"timezone": "UTC"}},
+        ]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
 async def test_discovery_lists_only_configured_usable_hefs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,

@@ -4,7 +4,7 @@
 
 **Blocked by:** 05: Complete the non-streaming tool handshake.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] OpenAI tool-call deltas include stable call IDs, indexes, names, and JSON-string arguments that standard clients can assemble.
 - [ ] Ollama NDJSON emits every completed tool call exactly once and ends successful streams with `done: true`.
