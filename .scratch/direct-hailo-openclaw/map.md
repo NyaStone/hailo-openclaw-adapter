@@ -11,6 +11,7 @@
 ## Decisions-so-far
 
 - [Issue 02](issues/02-expose-configured-model-discovery.md): public model IDs now resolve only to configured existing Qwen2.5-Coder HEFs; discovery reports the validated HEF format, 2,048-token context, and completion/tools capabilities, while unknown IDs fail before inference.
+- [Issue 03](issues/03-preserve-conversations-through-public-apis.md): both public chat APIs now pass the same complete sanitized conversation, request-specific tools, and normalized supported generation options to the backend; fake-backend tests verify the protocol boundary without native Hailo imports.
 
 ## Fog
 - Full OpenClaw tool-catalog capacity and model capability across other Qwen/LLM HEFs remain untested; validate those before advertising broader context or model support.
