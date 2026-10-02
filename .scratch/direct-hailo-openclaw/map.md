@@ -10,8 +10,7 @@
 
 ## Decisions-so-far
 
-- [Issue 01](issues/01-validate-target-hef-contract.md): target HEF prompt/tool validation completed with a synthetic call/result, successful fresh-context replay, measured context usage, completion status, and cleanup observations.
+- [Issue 02](issues/02-expose-configured-model-discovery.md): public model IDs now resolve only to configured existing Qwen2.5-Coder HEFs; discovery reports the validated HEF format, 2,048-token context, and completion/tools capabilities, while unknown IDs fail before inference.
 
 ## Fog
-
 - Full OpenClaw tool-catalog capacity and model capability across other Qwen/LLM HEFs remain untested; validate those before advertising broader context or model support.
