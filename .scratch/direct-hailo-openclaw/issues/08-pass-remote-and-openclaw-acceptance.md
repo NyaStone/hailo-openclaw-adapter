@@ -11,7 +11,7 @@
 - [x] Verify model discovery through `/api/show`.
 - [ ] Stream a harmless schema-driven call through OpenClaw.
 - [ ] Have OpenClaw execute the approved harmless tool, submit its synthetic result, and verify a grounded final answer.
-- [x] Do not merge the feature branch to `main` unless the remote test suite and required hardware acceptance checks pass.
+- [ ] Do not merge the feature branch to `main` unless the remote test suite and required hardware acceptance checks pass.
 
 ## Comments
 
