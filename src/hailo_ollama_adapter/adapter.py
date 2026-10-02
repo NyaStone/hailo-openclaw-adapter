@@ -12,10 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AsyncExitStack, suppress
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,15 +29,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # Configuration
 # --------------------------------------------------------------------------- #
 
-HAILO_DEFAULT_MODEL = "qwen3:1.7b"
 HAILO_URL = "http://127.0.0.1:8000/api/chat"
-HAILO_LIST_URL = "http://127.0.0.1:8000/api/tags"
 HAILO_HEADERS = {"Content-Type": "application/json"}
 
 REQUEST_TIMEOUT = 180.0
-LIST_TIMEOUT = 5.0
-STARTUP_RETRY_ATTEMPTS = 5
-STARTUP_RETRY_DELAY = 3.0
 MAX_USER_CONTENT_CHARS = 2000
 MAX_EXTRACTED_INTENT_CHARS = 500
 MAX_HISTORY_TURNS = 7
@@ -103,54 +101,7 @@ def _quarantine_hailo(reason: str) -> None:
     )
 
 
-@asynccontextmanager
-async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Kick off a background retry loop that populates the model cache.
-
-    The adapter starts serving immediately; while the first request may
-    briefly see the fallback model list, a background task keeps retrying
-    until Hailo becomes reachable and the real list is loaded.
-    """
-    task = asyncio.create_task(_preload_models_with_retry())
-    try:
-        yield
-    finally:
-        task.cancel()
-
-
-async def _preload_models_with_retry() -> None:
-    """Populate the model cache after bounded startup retries."""
-    for attempt in range(1, STARTUP_RETRY_ATTEMPTS + 1):
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(HAILO_LIST_URL, timeout=LIST_TIMEOUT)
-                response.raise_for_status()
-            models = _extract_model_list(response.json())
-        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
-            if attempt < STARTUP_RETRY_ATTEMPTS:
-                logger.info(
-                    "Hailo not ready yet (attempt %d/%d), retrying in %.1fs",
-                    attempt, STARTUP_RETRY_ATTEMPTS, STARTUP_RETRY_DELAY,
-                )
-                await asyncio.sleep(STARTUP_RETRY_DELAY)
-                continue
-            logger.warning(
-                "Hailo-Ollama still unreachable after %d attempts. "
-                "Check that the server is running; default %s will be used",
-                STARTUP_RETRY_ATTEMPTS,
-                HAILO_DEFAULT_MODEL,
-            )
-            models = [_DEFAULT_MODEL_INFO]
-        else:
-            models = models or [_DEFAULT_MODEL_INFO]
-
-        _model_cache.clear()
-        _model_cache.extend(models)
-        logger.info("Loaded %d Hailo model(s)", len(_model_cache))
-        return
-
-
-app = FastAPI(title="Hailo Adapter", version="1.0.0", lifespan=_lifespan)
+app = FastAPI(title="Hailo Adapter", version="1.0.0")
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +307,11 @@ def _build_payload(
     default_stream: bool,
 ) -> tuple[bytes, bool, str]:
     is_stream = request_data.get("stream", default_stream)
-    model_name = request_data.get("model") or HAILO_DEFAULT_MODEL
+    model_name = request_data.get("model")
+    if not isinstance(model_name, str) or not model_name:
+        raise HTTPException(status_code=400, detail="A model ID is required")
+    if _find_configured_model(model_name) is None:
+        raise HTTPException(status_code=404, detail="Model not found")
     messages = assemble_messages_for_hailo(
         normalize_messages(request_data.get("messages", []))
     )
@@ -622,106 +577,89 @@ def _extract_content(hailo_json: dict) -> str:
 # Model discovery
 # --------------------------------------------------------------------------- #
 
-_DEFAULT_MODEL_INFO = {
-    "name": HAILO_DEFAULT_MODEL,
-    "model": HAILO_DEFAULT_MODEL,
-    "modified_at": "2026-04-22T00:00:00.000Z",
-    "size": 0,
-    "digest": "",
-    "details": {
-        "parent_model": "",
-        "format": "gguf",
-        "family": "qwen3",
-        "families": ["qwen3"],
-        "parameter_size": "1.7B",
-        "quantization_level": "",
+_VALIDATED_HEF_PROFILES = {
+    "Qwen2.5-Coder-1.5B-Instruct.hef": {
+        "details": {
+            "parent_model": "",
+            "format": "hef",
+            "family": "qwen2",
+            "families": ["qwen2"],
+            "parameter_size": "1.5B",
+            "quantization_level": "unknown",
+        },
+        "context_length": 2048,
+        "capabilities": ["completion", "tools"],
     },
 }
 
-_model_cache: list[dict] = []
+
+def _configured_models() -> list[dict]:
+    """Return existing HEFs explicitly mapped to validated model profiles."""
+    raw_mapping = os.environ.get("HAILO_MODELS", "{}")
+    try:
+        mapping = json.loads(raw_mapping)
+    except json.JSONDecodeError:
+        logger.error("HAILO_MODELS must be a JSON object mapping public IDs to HEF paths")
+        return []
+    if not isinstance(mapping, dict):
+        logger.error("HAILO_MODELS must be a JSON object mapping public IDs to HEF paths")
+        return []
+
+    models = []
+    for model_id, raw_path in mapping.items():
+        if not isinstance(model_id, str) or not model_id or not isinstance(raw_path, str):
+            continue
+        path = Path(raw_path)
+        profile = _VALIDATED_HEF_PROFILES.get(path.name)
+        if profile is None:
+            logger.warning("Ignoring HEF without a validated profile: %s", path.name)
+            continue
+        try:
+            file_stat = path.stat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+
+        family = profile["details"]["family"]
+        models.append({
+            "name": model_id,
+            "model": model_id,
+            "modified_at": datetime.fromtimestamp(
+                file_stat.st_mtime,
+                tz=timezone.utc,
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "size": file_stat.st_size,
+            "digest": "",
+            "details": profile["details"],
+            "model_info": {f"{family}.context_length": profile["context_length"]},
+            "capabilities": profile["capabilities"],
+            "hef_path": str(path),
+        })
+    return models
 
 
-def _infer_family(name: str) -> str:
-    return name.split(":", 1)[0] if ":" in name else name
+def _find_configured_model(name: str) -> dict | None:
+    return next((model for model in _configured_models() if model["name"] == name), None)
 
 
-def _normalize_model_info(entry: Any) -> dict | None:
-    """Convert a Hailo list entry into an Ollama-style model dict."""
-    if isinstance(entry, str):
-        name = entry
-        details: dict[str, Any] = {}
-    elif isinstance(entry, dict):
-        name = entry.get("name") or entry.get("model") or entry.get("id")
-        details = entry
-    else:
-        return None
-
-    if not name:
-        return None
-
-    family = details.get("family") or _infer_family(name)
+def _ollama_model_info(model: dict) -> dict:
     return {
-        "name": name,
-        "model": name,
-        "modified_at": details.get("modified_at", "2026-01-01T00:00:00.000Z"),
-        "size": details.get("size", 0),
-        "digest": details.get("digest", ""),
-        "details": {
-            "parent_model": details.get("parent_model", ""),
-            "format": details.get("format", "gguf"),
-            "family": family,
-            "families": details.get("families", [family]),
-            "parameter_size": details.get("parameter_size", ""),
-            "quantization_level": details.get("quantization_level", ""),
-        },
+        key: model[key]
+        for key in ("name", "model", "modified_at", "size", "digest", "details")
     }
 
 
-def _extract_model_list(raw: Any) -> list[dict]:
-    """Accept several response shapes from Hailo's list endpoint."""
-    if isinstance(raw, list):
-        entries = raw
-    elif isinstance(raw, dict):
-        entries = (
-            raw.get("models")
-            or raw.get("available")
-            or raw.get("pulled")
-            or raw.get("items")
-            or []
-        )
-    else:
-        entries = []
-
-    models = [_normalize_model_info(e) for e in entries]
-    return [m for m in models if m]
-
-
-async def _refresh_models_from_hailo() -> list[dict]:
-    """Query Hailo for its current model list; fall back on failure."""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(HAILO_LIST_URL, timeout=LIST_TIMEOUT)
-            response.raise_for_status()
-        models = _extract_model_list(response.json())
-    except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError) as exc:
-        logger.warning("Hailo model list unavailable, using fallback: %s", exc)
-        return [_DEFAULT_MODEL_INFO]
-
-    return models or [_DEFAULT_MODEL_INFO]
-
-
 async def _get_models() -> list[dict]:
-    """Return the cached model list, populating it on first call."""
-    if not _model_cache:
-        _model_cache.extend(await _refresh_models_from_hailo())
-    return _model_cache
+    """Read configured usable models without acquiring the inference slot."""
+    return _configured_models()
 
 
 async def _get_model_details(name: str) -> dict:
-    for model in await _get_models():
-        if model["name"] == name:
-            return model
-    return _DEFAULT_MODEL_INFO
+    model = _find_configured_model(name)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return model
 
 
 # --------------------------------------------------------------------------- #
@@ -807,6 +745,8 @@ async def chat_completions(request: Request) -> Any:
             )
         hailo_response = await _post_hailo(body)
         return _openai_full_response(_extract_content(hailo_response), model)
+    except HTTPException:
+        raise
     except httpx.HTTPStatusError as exc:
         return _upstream_error_response(exc)
     except Exception as exc:
@@ -867,15 +807,14 @@ async def get_model(model_id: str) -> dict:
 
 @app.get("/api/tags")
 async def api_tags() -> dict:
-    return {"models": await _get_models()}
+    return {"models": [_ollama_model_info(model) for model in await _get_models()]}
 
 
 @app.post("/api/tags/refresh")
 async def api_tags_refresh() -> dict:
-    """Force a refresh of the cached Hailo model list."""
-    _model_cache.clear()
-    _model_cache.extend(await _refresh_models_from_hailo())
-    return {"models": _model_cache, "refreshed": True}
+    """Re-read configured model paths and report the usable entries."""
+    models = [_ollama_model_info(model) for model in await _get_models()]
+    return {"models": models, "refreshed": True}
 
 
 @app.post("/api/show")
@@ -884,11 +823,16 @@ async def api_show(request: Request) -> dict:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
         body = {}
-    name = body.get("model") or body.get("name") or HAILO_DEFAULT_MODEL
+    if not isinstance(body, dict):
+        body = {}
+    name = body.get("model") or body.get("name")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400, detail="A model ID is required")
     model = await _get_model_details(name)
     return {
         "details": model["details"],
-        "capabilities": ["completion"],
+        "model_info": model["model_info"],
+        "capabilities": model["capabilities"],
     }
 
 

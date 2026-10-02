@@ -256,9 +256,19 @@ In a second terminal:
 curl -s http://127.0.0.1:11435/api/tags | python3 -m json.tool
 ```
 
-If Hailo-Ollama is still starting when the adapter launches, the adapter
-retries up to 5 times with 3-second delays before falling back to a
-single default model entry. You can force a refresh at any time:
+Before starting the adapter, map public model IDs to HEF files with
+`HAILO_MODELS`. The value is a JSON object. Only existing HEFs with a
+validated model profile are exposed; the currently validated profile is
+`Qwen2.5-Coder-1.5B-Instruct.hef` (2,048-token context, completion and tools).
+
+```bash
+export HAILO_MODELS='{"qwen2.5-coder:1.5b":"/usr/local/hailo/resources/models/hailo10h/Qwen2.5-Coder-1.5B-Instruct.hef"}'
+hailo-ollama-adapter
+```
+
+The model ID on the left is what OpenClaw sees and must send on chat requests.
+There is no implicit default model or fallback listing. `/api/tags/refresh`
+re-reads the configured mapping and checks the HEF files again:
 
 ```bash
 curl -s -X POST http://127.0.0.1:11435/api/tags/refresh
