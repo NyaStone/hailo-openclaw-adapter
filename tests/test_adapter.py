@@ -665,15 +665,14 @@ async def test_api_show_reports_loaded_hef_context_capacity(
     monkeypatch.setattr(adapter.app.state, "inference_backend", None, raising=False)
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with adapter._lifespan(adapter.app):
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://adapter",
-        ) as client:
-            response = await client.post(
-                "/api/show",
-                json={"model": "Catalog-Model"},
-            )
+    async with adapter._lifespan(adapter.app), httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            "/api/show",
+            json={"model": "Catalog-Model"},
+        )
 
     assert response.status_code == 200
     assert response.json()["model_info"] == {"hailo.context_length": 4096}
