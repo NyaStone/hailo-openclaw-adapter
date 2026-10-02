@@ -122,6 +122,36 @@ async def test_public_routes_generate_text_with_mapped_hef(
 
 
 @pytest.mark.asyncio
+async def test_explicit_tool_choice_reaches_inference_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "public-id",
+                "messages": [{"role": "user", "content": "Do not use tools."}],
+                "tool_choice": "none",
+                "stream": False,
+            },
+        )
+
+    assert response.status_code == 200
+    assert backend.requests[0]["tool_choice"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_discovery_lists_only_configured_usable_hefs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
