@@ -283,6 +283,19 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
             "name": "lookup_weather",
             "content": "{\"temperature_c\":17,\n\"condition\":\"light rain\"}",
         },
+        *[
+            message
+            for turn in range(4)
+            for message in (
+                {
+                    "role": "user",
+                    "content": (
+                        "x" * 2101 if turn == 0 else f"Prior user message {turn}"
+                    ),
+                },
+                {"role": "assistant", "content": f"Prior answer {turn}"},
+            )
+        ],
         {"role": "user", "content": "Summarize the result.\nBe concise."},
     ]
     request_data: dict[str, Any] = {
