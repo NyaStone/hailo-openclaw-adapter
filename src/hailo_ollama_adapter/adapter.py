@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # --------------------------------------------------------------------------- #
@@ -595,19 +595,26 @@ _VALIDATED_HEF_PROFILES = {
 
 def _configured_models() -> list[dict]:
     """Return existing HEFs explicitly mapped to validated model profiles."""
+    config_error = (
+        "HAILO_MODELS must be a JSON object mapping public IDs to HEF paths"
+    )
     raw_mapping = os.environ.get("HAILO_MODELS", "{}")
     try:
         mapping = json.loads(raw_mapping)
     except json.JSONDecodeError:
-        logger.error("HAILO_MODELS must be a JSON object mapping public IDs to HEF paths")
+        logger.error(config_error)
         return []
     if not isinstance(mapping, dict):
-        logger.error("HAILO_MODELS must be a JSON object mapping public IDs to HEF paths")
+        logger.error(config_error)
         return []
 
     models = []
     for model_id, raw_path in mapping.items():
-        if not isinstance(model_id, str) or not model_id or not isinstance(raw_path, str):
+        if (
+            not isinstance(model_id, str)
+            or not model_id
+            or not isinstance(raw_path, str)
+        ):
             continue
         path = Path(raw_path)
         profile = _VALIDATED_HEF_PROFILES.get(path.name)
@@ -640,7 +647,10 @@ def _configured_models() -> list[dict]:
 
 
 def _find_configured_model(name: str) -> dict | None:
-    return next((model for model in _configured_models() if model["name"] == name), None)
+    return next(
+        (model for model in _configured_models() if model["name"] == name),
+        None,
+    )
 
 
 def _ollama_model_info(model: dict) -> dict:

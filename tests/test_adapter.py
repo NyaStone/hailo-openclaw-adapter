@@ -62,7 +62,10 @@ async def test_discovery_lists_only_configured_usable_hefs(
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         tags = await client.get("/api/tags")
         details = await client.post("/api/show", json={"model": "coder:1.5b"})
 
@@ -83,7 +86,10 @@ async def test_discovery_omits_unusable_hefs_without_fallback(
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(missing_hef)}))
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.get("/api/tags")
 
     assert response.json() == {"models": []}
@@ -99,7 +105,10 @@ async def test_unknown_model_details_return_not_found(
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post("/api/show", json={"model": "unknown"})
 
     assert response.status_code == 404
@@ -121,7 +130,10 @@ async def test_unknown_chat_model_is_rejected_before_upstream_call(
 
     monkeypatch.setattr(adapter, "_post_hailo", unexpected_post)
     transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post(
             path,
             json={"model": "unknown", "messages": [{"role": "user", "content": "hi"}]},
