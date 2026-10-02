@@ -266,15 +266,7 @@ def test_chat_translation_selects_the_configured_local_hef(
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
 
-    (
-        model,
-        messages,
-        generation,
-        tools,
-        tool_choice,
-        is_stream,
-        response_model,
-    ) = adapter._build_inference_request(
+    request = adapter._build_inference_request(
         {
             "model": "public-id",
             "messages": [{"role": "user", "content": "hello"}],
@@ -282,13 +274,13 @@ def test_chat_translation_selects_the_configured_local_hef(
         default_stream=False,
     )
 
-    assert model["hef_path"] == str(hef_path)
-    assert messages == [{"role": "user", "content": "hello"}]
-    assert generation == {}
-    assert tools is None
-    assert tool_choice == "auto"
-    assert is_stream is False
-    assert response_model == "public-id"
+    assert request.hef_path == str(hef_path)
+    assert request.messages == [{"role": "user", "content": "hello"}]
+    assert request.generation == {}
+    assert request.tools is None
+    assert request.tool_choice == "auto"
+    assert request.stream is False
+    assert request.public_model_id == "public-id"
 
 
 @pytest.mark.asyncio
