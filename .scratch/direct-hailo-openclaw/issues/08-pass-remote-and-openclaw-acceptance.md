@@ -13,7 +13,9 @@
 - [ ] Have OpenClaw execute the approved harmless tool, submit its synthetic result, and verify a grounded final answer.
 - [x] Do not merge the feature branch to `main` unless the remote test suite and required hardware acceptance checks pass.
 
-## Acceptance Record
+## Comments
+
+### Acceptance Record
 
 - Feature branch: `tickets/08`
 - Tested commit: `05fe66a317a187a9defe31d5e0a490e83708b25f`
@@ -27,6 +29,6 @@
 - `openclaw --profile hailo-acceptance models list --refresh` discovered the model and reported its 2k context.
 - `openclaw --profile hailo-acceptance agent --local --model ollama/qwen2.5-coder:1.5b --message 'Reply with exactly: Hailo provider connection works.' --thinking off --timeout 240 --json` was rejected before inference: OpenClaw 2026.9.5 requires at least 4,000 context tokens; the validated HEF reports 2,048.
 
-## Blocker
+### Blocker
 
 The model discovery and public API checks pass, but OpenClaw refuses to start an agent turn with the truthful 2,048-token HEF profile. Consequently no streamed schema-driven call, tool execution, synthetic result replay, or grounded final answer was completed. Do not raise the configured context above the HEF's measured capacity to bypass OpenClaw's minimum. Resume acceptance only with a validated supported HEF profile of at least 4,000 tokens or an OpenClaw version that supports this model's actual context.
