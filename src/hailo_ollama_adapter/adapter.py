@@ -230,6 +230,7 @@ class ChatRequest:
     messages: list[dict]
     generation: dict
     tools: list[dict] | None
+    tool_inventory: dict[str, dict]
     tool_choice: str
     stream: bool
     public_model_id: str
@@ -288,11 +289,12 @@ def _build_inference_request(
         raise HTTPException(status_code=404, detail="Model not found")
     messages = normalize_messages(request_data.get("messages", []))
     tools = request_data.get("tools")
+    tool_inventory = {}
     if tools is not None and not isinstance(tools, list):
         raise HTTPException(status_code=400, detail="tools must be a list")
     if tools is not None:
         tools = _deep_sanitize(tools)
-        _validate_tool_inventory(tools)
+        tool_inventory = _validate_tool_inventory(tools)
     tool_choice = request_data.get("tool_choice", "auto")
     if not isinstance(tool_choice, str) or tool_choice not in ("auto", "none"):
         raise HTTPException(
@@ -304,6 +306,7 @@ def _build_inference_request(
         messages=messages,
         generation=_generation_options(request_data),
         tools=tools,
+        tool_inventory=tool_inventory,
         tool_choice=tool_choice,
         stream=is_stream,
         public_model_id=public_model_id,
@@ -333,7 +336,7 @@ async def _run_chat_request(
         raise BackendGenerationError("Native Hailo returned an invalid response")
     result = _parse_generated_response(
         generated,
-        chat_request.tools if chat_request.tool_choice == "auto" else None,
+        chat_request.tool_inventory if chat_request.tool_choice == "auto" else {},
     )
     if chat_request.stream and result.tool_calls:
         raise BackendGenerationError(
@@ -398,7 +401,10 @@ def _parse_tool_payload(payload: str) -> dict[str, Any]:
     return call
 
 
-def _parse_generated_response(generated: str, tools: list[dict] | None) -> ChatResult:
+def _parse_generated_response(
+    generated: str,
+    tool_inventory: dict[str, dict],
+) -> ChatResult:
     open_count = generated.count("<tool_call>")
     close_count = generated.count("</tool_call>")
     if (
@@ -410,11 +416,10 @@ def _parse_generated_response(generated: str, tools: list[dict] | None) -> ChatR
     if not open_count:
         return ChatResult(generated.strip(), [])
 
-    inventory = _validate_tool_inventory(tools)
     calls = []
     for match in re.finditer(r"<tool_call>(.*?)</tool_call>", generated, re.DOTALL):
         parsed = _parse_tool_payload(match.group(1).strip())
-        schema = inventory.get(parsed["name"])
+        schema = tool_inventory.get(parsed["name"])
         if schema is None:
             raise BackendGenerationError("Generated tool name is not in this request")
         try:
