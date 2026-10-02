@@ -30,7 +30,7 @@ is close to, but not quite, Ollama-compatible. This adapter sits between
 them on port 11435 and translates:
 
 - OpenClaw -> adapter (standard Ollama `/api/tags`, `/api/show`, `/api/chat`)
-- adapter -> Hailo (sanitized JSON, model list from `/api/tags`)
+- adapter -> Hailo-Ollama (sanitized chat JSON with the configured local HEF path)
 
 It also handles three Hailo 5.3.0 changes that would otherwise break the
 conversation: strict JSON parsing (control chars rejected), newline-in-
