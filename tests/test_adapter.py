@@ -603,6 +603,7 @@ def test_discovery_uses_installed_hailo_apps_agent_models(
         "size": 0,
         "digest": "",
         "details": {"format": "hef"},
+        "model_info": {},
         "capabilities": ["completion", "tools"],
         "hef_path": str(hef_path),
     }]
