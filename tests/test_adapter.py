@@ -982,10 +982,22 @@ async def test_public_routes_return_validated_tool_calls(
 @pytest.mark.parametrize(
     "messages",
     [
-        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}]}],
+        [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/image.png"},
+            }],
+        }],
         [{"role": "user", "content": [{"type": "audio", "data": "AAAA"}]}],
         [{"role": "user", "content": "Describe this.", "images": ["AAAA"]}],
-        [{"role": "user", "content": {"type": "image_url", "url": "https://example.test/image.png"}}],
+        [{
+            "role": "user",
+            "content": {
+                "type": "image_url",
+                "url": "https://example.test/image.png",
+            },
+        }],
     ],
 )
 async def test_text_only_models_reject_unsupported_media(
