@@ -539,7 +539,7 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
 async def test_cancelled_waiter_does_not_release_native_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = NativeHailoBackend(queue_size=1, request_timeout=10)
+    backend = NativeHailoBackend(queue_size=1, request_timeout=0.05)
     started = threading.Event()
     release = threading.Event()
     lock = threading.Lock()
@@ -575,9 +575,13 @@ async def test_cancelled_waiter_does_not_release_native_worker(
         await asyncio.sleep(0)
         with pytest.raises(BackendBusyError):
             await backend.generate("fake.hef", [], {})
+        with pytest.raises(BackendTimeoutError):
+            await second
+        assert active_calls == 1
         release.set()
-        assert await second == "complete"
+        await backend.close()
         assert maximum_active_calls == 1
     finally:
         release.set()
-        await backend.close()
+        if backend.status["status"] != "stopped":
+            await backend.close()
