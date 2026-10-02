@@ -78,7 +78,7 @@ def test_flatten_newlines_preserves_words_without_literal_line_breaks() -> None:
     ("path", "expected"),
     [
         ("/api/chat", {"message": {"role": "assistant", "content": "Hailo says hello."}}),
-        ("/v1/chat/completions", {"choices": [{"message": {"role": "assistant", "content": "Hailo says hello."}}]}),
+        ("/v1/chat/completions", {"choices": [{"index": 0, "message": {"role": "assistant", "content": "Hailo says hello."}, "finish_reason": "stop"}]}),
     ],
 )
 async def test_public_routes_generate_text_with_mapped_hef(
