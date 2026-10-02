@@ -166,6 +166,21 @@ def to_openai_chunk(
     return f"data: {json.dumps(chunk)}\n\n"
 
 
+def _openai_tool_call(call: dict[str, Any], index: int | None = None) -> dict:
+    formatted = {"id": call["id"], "type": "function"}
+    if index is not None:
+        formatted["index"] = index
+    formatted["function"] = {
+        "name": call["name"],
+        "arguments": json.dumps(
+            call["arguments"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    return formatted
+
+
 def _openai_full_response(result: ChatResult, model: str) -> dict:
     now = int(time.time())
     message: dict[str, Any] = {
@@ -173,21 +188,7 @@ def _openai_full_response(result: ChatResult, model: str) -> dict:
         "content": result.content if result.content or not result.tool_calls else None,
     }
     if result.tool_calls:
-        message["tool_calls"] = [
-            {
-                "id": call["id"],
-                "type": "function",
-                "function": {
-                    "name": call["name"],
-                    "arguments": json.dumps(
-                        call["arguments"],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                },
-            }
-            for call in result.tool_calls
-        ]
+        message["tool_calls"] = [_openai_tool_call(call) for call in result.tool_calls]
     return {
         "id": f"chatcmpl-{now}",
         "object": "chat.completion",
@@ -556,19 +557,7 @@ async def _stream_openai(result: ChatResult, model: str) -> AsyncIterator[str]:
         yield to_openai_chunk(
             "",
             model,
-            tool_calls=[{
-                "index": index,
-                "id": call["id"],
-                "type": "function",
-                "function": {
-                    "name": call["name"],
-                    "arguments": json.dumps(
-                        call["arguments"],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                },
-            }],
+            tool_calls=[_openai_tool_call(call, index)],
         )
     yield to_openai_chunk(
         "",
