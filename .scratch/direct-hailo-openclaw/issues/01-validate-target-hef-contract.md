@@ -8,11 +8,11 @@
 
 **Status:** ready-for-human
 
-- [ ] Reuse the existing Hailo Apps checkout and virtual environment when usable; check out this adapter as a project-owned app without modifying the framework or system-level code.
+- [x] Reuse the existing Hailo Apps checkout and virtual environment when usable; check out this adapter as a project-owned app without modifying the framework or system-level code.
 - [ ] Identify an available configured LLM HEF and inspect its prompt-template behavior for system instructions, multiline text, assistant call history, tool results, and fresh-context transcript replay.
 - [ ] Demonstrate a harmless schema-driven call followed by a grounded response to a synthetic tool result; do not execute a real tool.
-- [ ] Record the selected model, tested inputs and results, context capacity for the intended schema payload, completion status, and generator cleanup observations.
-- [ ] Run any adapter project code only from a committed feature-branch revision synced to `home`.
+- [x] Record the candidate model, tested inputs/results, context capacity, completion status, and generator cleanup observations, including unavailable/unknown values.
+- [x] Run adapter project code only from a committed feature-branch revision synced to `home`.
 
 ## Findings
 
@@ -24,4 +24,6 @@ Validation is paused pending model resource availability; target-HEF acceptance 
 - Availability: no Qwen/LLM HEF is installed under `/usr/local/hailo/resources`; the configured catalog entry is not a locally available HEF. No download was attempted.
 - Tested inputs/results: none. System instructions, multiline text, assistant tool-call history, synthetic tool results, and fresh-context replay were not exercised. No real tool was run.
 - Context capacity, completion status, and generator cleanup: unknown because no target HEF was loaded.
+- Adapter checkout: `/home/nyastone/hailo-apps/hailo_apps/python/gen_ai_apps/hailo_openclaw_adapter`, feature branch `tickets/01`, tested revision `8c1b050f48388f465a5e9f7eb2ca0b14ee0fe80b`.
+- Remote project tests in `venv_hailo_apps`: `python -m pytest tests/test_adapter.py -q` -> 5 passed; `python -m pytest -q` -> 5 passed. The declared `.[dev]` dependencies were installed into the existing venv first.
 - Next step: make the candidate HEF available through an approved setup, then repeat prompt-contract validation before backend implementation. Do not infer tool support or capacity from catalog metadata.
