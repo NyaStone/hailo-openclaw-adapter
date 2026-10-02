@@ -249,7 +249,10 @@ def _validate_tool_inventory(tools: list[dict] | None) -> dict[str, dict]:
             or tool.get("type", "function") != "function"
             or not isinstance(tool.get("function"), dict)
         ):
-            raise HTTPException(status_code=400, detail="Each tool must define a function")
+            raise HTTPException(
+                status_code=400,
+                detail="Each tool must define a function",
+            )
         function = tool["function"]
         name = function.get("name")
         schema = function.get("parameters", {"type": "object"})
@@ -260,7 +263,10 @@ def _validate_tool_inventory(tools: list[dict] | None) -> dict[str, dict]:
         try:
             Draft202012Validator.check_schema(schema)
         except SchemaError as exc:
-            raise HTTPException(status_code=400, detail="Invalid function JSON schema") from exc
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid function JSON schema",
+            ) from exc
         inventory[name] = schema
     return inventory
 
@@ -344,14 +350,18 @@ def _xml_value(element: ET.Element) -> Any:
             value = _xml_value(child)
             if child.tag in values:
                 existing = values[child.tag]
-                values[child.tag] = existing + [value] if isinstance(existing, list) else [existing, value]
+                values[child.tag] = (
+                    existing + [value]
+                    if isinstance(existing, list)
+                    else [existing, value]
+                )
             else:
                 values[child.tag] = value
         return values
     text = (element.text or "").strip()
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as json_error:
         return text
 
 
@@ -366,7 +376,7 @@ def _parse_tool_payload(payload: str) -> dict[str, Any]:
         name_element = root.find("name")
         arguments_element = root.find("arguments")
         if name_element is None or arguments_element is None:
-            raise BackendGenerationError("Incomplete tool call output")
+            raise BackendGenerationError("Incomplete tool call output") from json_error
         raw_arguments = (arguments_element.text or "").strip()
         if raw_arguments:
             try:
@@ -382,7 +392,9 @@ def _parse_tool_payload(payload: str) -> dict[str, Any]:
         or not call["name"]
         or not isinstance(call.get("arguments"), dict)
     ):
-        raise BackendGenerationError("Tool call must contain a name and object arguments")
+        raise BackendGenerationError(
+            "Tool call must contain a name and object arguments"
+        )
     return call
 
 
@@ -408,7 +420,9 @@ def _parse_generated_response(generated: str, tools: list[dict] | None) -> ChatR
         try:
             Draft202012Validator(schema).validate(parsed["arguments"])
         except ValidationError as exc:
-            raise BackendGenerationError("Generated tool arguments fail schema validation") from exc
+            raise BackendGenerationError(
+                "Generated tool arguments fail schema validation"
+            ) from exc
         calls.append({
             "id": f"call_{uuid.uuid4().hex}",
             "name": parsed["name"],
