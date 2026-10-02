@@ -203,6 +203,7 @@ async def test_streaming_routes_terminate_with_protocol_marker(
             chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
         )
         assert content == "Streamed answer."
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 
 @pytest.mark.asyncio
@@ -298,6 +299,117 @@ async def test_streaming_routes_emit_text_and_each_tool_call_once(
             {"name": "lookup_time", "arguments": {"timezone": "UTC"}},
         ]
         assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_streaming_routes_emit_a_single_tool_call(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(
+        response=(
+            '<tool_call>{"name":"lookup_weather",'
+            '"arguments":{"city":"Testville"}}</tool_call>'
+        ),
+    )
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Check the weather."}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    if path == "/api/chat":
+        records = [json.loads(line) for line in response.text.splitlines()]
+        assert records[-1]["done"] is True
+        calls = records[-1]["message"]["tool_calls"]
+        assert len(calls) == 1
+        assert calls[0]["function"] == {
+            "name": "lookup_weather",
+            "arguments": {"city": "Testville"},
+        }
+    else:
+        events = [
+            line[6:]
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        chunks = [json.loads(event) for event in events[:-1]]
+        calls = [
+            call
+            for chunk in chunks
+            for call in chunk["choices"][0]["delta"].get("tool_calls", [])
+        ]
+        assert events[-1] == "[DONE]"
+        assert len(calls) == 1
+        assert calls[0]["index"] == 0
+        assert calls[0]["type"] == "function"
+        assert calls[0]["function"]["name"] == "lookup_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {
+            "city": "Testville"
+        }
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_streaming_generation_failure_has_no_success_terminal_marker(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    error = BackendGenerationError("native generation failed")
+    backend = FakeInferenceBackend(error=error)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Answer."}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {"error": str(error)}
+    assert response.headers["content-type"].startswith("application/json")
+    assert "[DONE]" not in response.text
+    assert '"done": true' not in response.text
 
 
 @pytest.mark.asyncio
