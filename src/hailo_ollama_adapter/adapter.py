@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from hailo_ollama_adapter.backend import (
     BackendBusyError,
@@ -161,7 +164,31 @@ def to_openai_chunk(
 
 
 def _openai_full_response(content: str, model: str) -> dict:
+    raise NotImplementedError
+
+
+def _openai_full_response(result: ChatResult, model: str) -> dict:
     now = int(time.time())
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": result.content if result.content or not result.tool_calls else None,
+    }
+    if result.tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": json.dumps(
+                        call["arguments"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+            for call in result.tool_calls
+        ]
     return {
         "id": f"chatcmpl-{now}",
         "object": "chat.completion",
@@ -169,17 +196,30 @@ def _openai_full_response(content: str, model: str) -> dict:
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": "tool_calls" if result.tool_calls else "stop",
         }],
     }
 
 
-def _ollama_full_response(content: str, model: str) -> dict:
+def _ollama_full_response(result: ChatResult, model: str) -> dict:
+    message: dict[str, Any] = {"role": "assistant", "content": result.content}
+    if result.tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": call["arguments"],
+                },
+            }
+            for call in result.tool_calls
+        ]
     return {
         "model": model,
         "created_at": f"{int(time.time())}",
-        "message": {"role": "assistant", "content": content},
+        "message": message,
         "done": True,
     }
 
@@ -197,6 +237,32 @@ class ChatRequest:
     tool_choice: str
     stream: bool
     public_model_id: str
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    content: str
+    tool_calls: list[dict[str, Any]]
+
+
+def _validate_tool_inventory(tools: list[dict] | None) -> dict[str, dict]:
+    inventory = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
+            raise HTTPException(status_code=400, detail="Each tool must define a function")
+        function = tool["function"]
+        name = function.get("name")
+        schema = function.get("parameters", {"type": "object"})
+        if not isinstance(name, str) or not name or not isinstance(schema, dict):
+            raise HTTPException(status_code=400, detail="Invalid function tool schema")
+        if name in inventory:
+            raise HTTPException(status_code=400, detail="Tool names must be unique")
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as exc:
+            raise HTTPException(status_code=400, detail="Invalid function JSON schema") from exc
+        inventory[name] = schema
+    return inventory
 
 
 def _build_inference_request(
@@ -220,6 +286,7 @@ def _build_inference_request(
         raise HTTPException(status_code=400, detail="tools must be a list")
     if tools is not None:
         tools = _deep_sanitize(tools)
+        _validate_tool_inventory(tools)
     tool_choice = request_data.get("tool_choice", "auto")
     if not isinstance(tool_choice, str) or tool_choice not in ("auto", "none"):
         raise HTTPException(
@@ -247,16 +314,108 @@ def _get_backend() -> Any:
 async def _run_chat_request(
     request_data: dict,
     default_stream: bool,
-) -> tuple[ChatRequest, str]:
+) -> tuple[ChatRequest, ChatResult]:
     chat_request = _build_inference_request(request_data, default_stream)
-    content = await _get_backend().generate(
+    generated = await _get_backend().generate(
         chat_request.hef_path,
         chat_request.messages,
         chat_request.generation,
         tools=chat_request.tools,
         tool_choice=chat_request.tool_choice,
     )
-    return chat_request, content
+    if not isinstance(generated, str):
+        raise BackendGenerationError("Native Hailo returned an invalid response")
+    result = _parse_generated_response(
+        generated,
+        chat_request.tools if chat_request.tool_choice == "auto" else None,
+    )
+    if chat_request.stream and result.tool_calls:
+        raise BackendGenerationError(
+            "Streaming tool calls are not supported by this endpoint yet"
+        )
+    return chat_request, result
+
+
+def _xml_value(element: ET.Element) -> Any:
+    children = list(element)
+    if children:
+        values: dict[str, Any] = {}
+        for child in children:
+            value = _xml_value(child)
+            if child.tag in values:
+                existing = values[child.tag]
+                values[child.tag] = existing + [value] if isinstance(existing, list) else [existing, value]
+            else:
+                values[child.tag] = value
+        return values
+    text = (element.text or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _parse_tool_payload(payload: str) -> dict[str, Any]:
+    try:
+        call = json.loads(payload)
+    except json.JSONDecodeError:
+        try:
+            root = ET.fromstring(f"<root>{payload}</root>")
+        except ET.ParseError as exc:
+            raise BackendGenerationError("Malformed tool call output") from exc
+        name_element = root.find("name")
+        arguments_element = root.find("arguments")
+        if name_element is None or arguments_element is None:
+            raise BackendGenerationError("Incomplete tool call output")
+        raw_arguments = (arguments_element.text or "").strip()
+        if raw_arguments:
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                arguments = _xml_value(arguments_element)
+        else:
+            arguments = _xml_value(arguments_element)
+        call = {"name": (name_element.text or "").strip(), "arguments": arguments}
+    if (
+        not isinstance(call, dict)
+        or not isinstance(call.get("name"), str)
+        or not call["name"]
+        or not isinstance(call.get("arguments"), dict)
+    ):
+        raise BackendGenerationError("Tool call must contain a name and object arguments")
+    return call
+
+
+def _parse_generated_response(generated: str, tools: list[dict] | None) -> ChatResult:
+    open_count = generated.count("<tool_call>")
+    close_count = generated.count("</tool_call>")
+    if (
+        open_count != close_count
+        or ("<tool_call" in generated and open_count == 0)
+        or ("</tool_call" in generated and close_count == 0)
+    ):
+        raise BackendGenerationError("Incomplete or malformed tool call output")
+    if not open_count:
+        return ChatResult(generated.strip(), [])
+
+    inventory = _validate_tool_inventory(tools)
+    calls = []
+    for match in re.finditer(r"<tool_call>(.*?)</tool_call>", generated, re.DOTALL):
+        parsed = _parse_tool_payload(match.group(1).strip())
+        schema = inventory.get(parsed["name"])
+        if schema is None:
+            raise BackendGenerationError("Generated tool name is not in this request")
+        try:
+            Draft202012Validator(schema).validate(parsed["arguments"])
+        except ValidationError as exc:
+            raise BackendGenerationError("Generated tool arguments fail schema validation") from exc
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex}",
+            "name": parsed["name"],
+            "arguments": parsed["arguments"],
+        })
+    remaining = re.sub(r"<tool_call>.*?</tool_call>", "", generated, flags=re.DOTALL)
+    return ChatResult(remaining.strip(), calls)
 
 
 def _backend_error_response(exc: Exception) -> JSONResponse:
