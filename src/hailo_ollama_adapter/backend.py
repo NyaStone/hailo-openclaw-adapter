@@ -247,13 +247,14 @@ class NativeHailoBackend:
             completion_status = completion.generation_status
         if not isinstance(result, str):
             raise TypeError("HailoRT returned a non-text generation result")
-        generated_tokens = int(llm.get_context_usage_size()) - prompt_tokens
         status_name = getattr(completion_status, "name", str(completion_status)).upper()
-        if generated_tokens >= output_allowance or any(
-            marker in status_name for marker in ("MAX_TOKEN", "TOKEN_LIMIT", "LENGTH")
-        ):
+        if status_name.endswith("MAX_TOKENS_REACHED"):
             raise BackendOutputExhaustedError(
                 "Generation stopped at the output token limit before a normal stop"
+            )
+        if not status_name.endswith("LOGICAL_END_OF_GENERATION"):
+            raise BackendGenerationError(
+                f"Hailo generation ended with unsafe status: {status_name}"
             )
         return _clean_generated_text(result)
 

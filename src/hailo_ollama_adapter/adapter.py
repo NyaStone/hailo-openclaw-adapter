@@ -125,14 +125,22 @@ _GENERATION_OPTION_ALIASES = {
 }
 
 _UNSUPPORTED_GENERATION_OPTIONS = {
+    "audio",
     "format",
     "logit_bias",
     "logprobs",
+    "modalities",
     "n",
+    "parallel_tool_calls",
+    "prediction",
     "presence_penalty",
+    "reasoning_effort",
     "response_format",
+    "service_tier",
     "stop",
+    "stream_options",
     "top_logprobs",
+    "verbosity",
 }
 
 
@@ -157,15 +165,22 @@ def _validate_request_options(request_data: dict) -> None:
 
 
 def _validate_text_only_messages(request_data: dict) -> None:
-    if request_data.get("images"):
-        raise HTTPException(status_code=400, detail="Unsupported media: images")
+    if any(request_data.get(field) for field in ("images", "audio", "video")):
+        raise HTTPException(status_code=400, detail="Unsupported media in request")
     messages = request_data.get("messages", [])
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="messages must be a list")
     for message in messages:
         if not isinstance(message, dict):
             raise HTTPException(status_code=400, detail="Each message must be an object")
+        if any(message.get(field) for field in ("images", "audio", "video")):
+            raise HTTPException(status_code=400, detail="Unsupported media in message")
         content = message.get("content", "")
+        if content is not None and not isinstance(content, (str, list)):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported media: this model accepts text only",
+            )
         if isinstance(content, list) and any(
             not isinstance(part, dict)
             or part.get("type") != "text"
