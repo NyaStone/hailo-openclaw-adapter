@@ -231,3 +231,89 @@ async def test_chat_endpoint_preserves_upstream_status(
 
     assert response.status_code == 404
     assert response.json() == {"error": "model 'missing' not found"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_public_routes_preserve_conversation_for_injected_backend(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    observed: list[dict[str, Any]] = []
+
+    async def fake_backend(body: bytes) -> dict[str, Any]:
+        observed.append(json.loads(body))
+        return {"message": {"content": "Tool result received."}}
+
+    monkeypatch.setattr(adapter, "_post_hailo", fake_backend)
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "lookup_weather",
+            "description": "Look up weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+    messages = [
+        {"role": "system", "content": "Follow these rules.\nKeep both lines."},
+        {"role": "user", "content": "What is the weather?\nUse the tool."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-weather-1",
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": {"city": "Testville"},
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-weather-1",
+            "name": "lookup_weather",
+            "content": "{\"temperature_c\":17,\n\"condition\":\"light rain\"}",
+        },
+        {"role": "user", "content": "Summarize the result.\nBe concise."},
+    ]
+    request_data: dict[str, Any] = {
+        "model": "configured",
+        "messages": messages,
+        "tools": [tool_schema],
+        "tool_choice": "auto",
+        "stream": False,
+    }
+    if path == "/api/chat":
+        request_data["options"] = {
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "num_predict": 64,
+        }
+    else:
+        request_data.update({"temperature": 0.2, "top_p": 0.8, "max_tokens": 64})
+
+    transport = httpx.ASGITransport(app=adapter.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(path, json=request_data)
+
+    assert response.status_code == 200
+    assert len(observed) == 1
+    assert observed[0]["messages"] == messages
+    assert observed[0]["tools"] == [tool_schema]
+    assert observed[0]["generation"] == {
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "max_generated_tokens": 64,
+    }
