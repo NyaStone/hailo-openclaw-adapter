@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,6 @@ from hailo_ollama_adapter.backend import (
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-
-REQUEST_TIMEOUT = 180.0
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -143,12 +142,12 @@ def to_openai_chunk(
     content: str,
     model: str,
     finish_reason: str | None = None,
-    is_meta: bool = False,
+    is_role_header: bool = False,
 ) -> str:
     now = int(time.time())
     delta = (
         {"role": "assistant", "content": content}
-        if is_meta
+        if is_role_header
         else {"content": content}
     )
     chunk = {
@@ -189,10 +188,21 @@ def _ollama_full_response(content: str, model: str) -> dict:
 # Direct inference request translation
 # --------------------------------------------------------------------------- #
 
+@dataclass(frozen=True)
+class ChatRequest:
+    hef_path: str
+    messages: list[dict]
+    generation: dict
+    tools: list[dict] | None
+    tool_choice: str
+    stream: bool
+    public_model_id: str
+
+
 def _build_inference_request(
     request_data: dict,
     default_stream: bool,
-) -> tuple[dict, list[dict], dict, list[dict] | None, str, bool, str]:
+) -> ChatRequest:
     if not isinstance(request_data, dict):
         raise HTTPException(status_code=400, detail="A JSON object is required")
     is_stream = request_data.get("stream", default_stream)
@@ -216,14 +226,14 @@ def _build_inference_request(
             status_code=400,
             detail="tool_choice must be 'auto' or 'none' for this backend",
         )
-    return (
-        model,
-        messages,
-        _generation_options(request_data),
-        tools,
-        tool_choice,
-        is_stream,
-        public_model_id,
+    return ChatRequest(
+        hef_path=model["hef_path"],
+        messages=messages,
+        generation=_generation_options(request_data),
+        tools=tools,
+        tool_choice=tool_choice,
+        stream=is_stream,
+        public_model_id=public_model_id,
     )
 
 
@@ -232,6 +242,21 @@ def _get_backend() -> Any:
     if backend is None:
         raise BackendUnavailableError("Hailo backend has not started")
     return backend
+
+
+async def _run_chat_request(
+    request_data: dict,
+    default_stream: bool,
+) -> tuple[ChatRequest, str]:
+    chat_request = _build_inference_request(request_data, default_stream)
+    content = await _get_backend().generate(
+        chat_request.hef_path,
+        chat_request.messages,
+        chat_request.generation,
+        tools=chat_request.tools,
+        tool_choice=chat_request.tool_choice,
+    )
+    return chat_request, content
 
 
 def _backend_error_response(exc: Exception) -> JSONResponse:
@@ -347,7 +372,7 @@ async def _get_model_details(name: str) -> dict:
 
 async def _stream_openai(content: str, model: str) -> AsyncIterator[str]:
     """Frame a completed native text generation as OpenAI SSE."""
-    yield to_openai_chunk("", model, is_meta=True)
+    yield to_openai_chunk("", model, is_role_header=True)
     if content:
         yield to_openai_chunk(content, model)
     yield to_openai_chunk("", model, finish_reason="stop")
@@ -374,31 +399,16 @@ async def _stream_ollama(content: str, model: str) -> AsyncIterator[str]:
 async def chat_completions(request: Request) -> Any:
     """Serve OpenAI chat completions, defaulting requests to non-streaming."""
     try:
-        (
-            native_model,
-            messages,
-            generation,
-            tools,
-            tool_choice,
-            is_stream,
-            model,
-        ) = _build_inference_request(
+        chat_request, content = await _run_chat_request(
             await request.json(),
             default_stream=False,
         )
-        backend = _get_backend()
-        content = await backend.generate(
-            native_model["hef_path"],
-            messages,
-            generation,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
-        if is_stream:
+        if chat_request.stream:
             return StreamingResponse(
-                _stream_openai(content, model), media_type="text/event-stream",
+                _stream_openai(content, chat_request.public_model_id),
+                media_type="text/event-stream",
             )
-        return _openai_full_response(content, model)
+        return _openai_full_response(content, chat_request.public_model_id)
     except HTTPException:
         raise
     except (BackendBusyError, BackendUnavailableError, BackendTimeoutError,
@@ -507,31 +517,16 @@ async def api_show(request: Request) -> dict:
 async def api_chat(request: Request) -> Any:
     """ Serve Ollama chat requests, defaulting to NDJSON streaming."""
     try:
-        (
-            native_model,
-            messages,
-            generation,
-            tools,
-            tool_choice,
-            is_stream,
-            model,
-        ) = _build_inference_request(
+        chat_request, content = await _run_chat_request(
             await request.json(),
             default_stream=True,
         )
-        backend = _get_backend()
-        content = await backend.generate(
-            native_model["hef_path"],
-            messages,
-            generation,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
-        if is_stream:
+        if chat_request.stream:
             return StreamingResponse(
-                _stream_ollama(content, model), media_type="application/x-ndjson",
+                _stream_ollama(content, chat_request.public_model_id),
+                media_type="application/x-ndjson",
             )
-        return _ollama_full_response(content, model)
+        return _ollama_full_response(content, chat_request.public_model_id)
     except HTTPException:
         raise
     except (BackendBusyError, BackendUnavailableError, BackendTimeoutError,
