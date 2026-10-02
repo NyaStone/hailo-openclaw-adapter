@@ -9,34 +9,29 @@ import httpx
 import pytest
 
 from hailo_ollama_adapter import adapter
-
-
-class ErrorPostingAsyncClient:
-    """Return a native non-success response for chat error propagation tests."""
-
-    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    async def __aenter__(self) -> ErrorPostingAsyncClient:
-        return self
-
-    async def __aexit__(self, *_args: Any) -> None:
-        return None
-
-    async def post(self, url: str, **_kwargs: Any) -> httpx.Response:
-        request = httpx.Request("POST", url)
-        return httpx.Response(
-            404,
-            request=request,
-            json={"error": "model 'missing' not found"},
-        )
+from hailo_ollama_adapter.backend import (
+    BackendBusyError,
+    BackendGenerationError,
+    BackendTimeoutError,
+    BackendUnavailableError,
+)
 
 
 class FakeInferenceBackend:
     """Record public API inference requests without native Hailo imports."""
 
-    def __init__(self, response: str = "Hailo says hello.") -> None:
+    def __init__(
+        self,
+        response: str = "Hailo says hello.",
+        error: Exception | None = None,
+        started: Any = None,
+        release: Any = None,
+    ) -> None:
         self.response = response
+        self.error = error
+        self.started = started
+        self.release = release
+        self.status = {"status": "ready", "ready": True, "error": None, "queued": 0}
         self.requests: list[dict[str, Any]] = []
 
     async def generate(
@@ -44,33 +39,23 @@ class FakeInferenceBackend:
         hef_path: str,
         messages: list[dict[str, Any]],
         generation: dict[str, Any],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> str:
         self.requests.append({
             "hef_path": hef_path,
             "messages": messages,
             "generation": generation,
+            "tools": tools,
+            "tool_choice": tool_choice,
         })
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
+        if self.error is not None:
+            raise self.error
         return self.response
-
-
-def upstream_status_error(
-    status_code: int,
-    payload: dict[str, str],
-) -> httpx.HTTPStatusError:
-    """Build a realistic Hailo status exception for endpoint tests."""
-    request = httpx.Request("POST", adapter.HAILO_URL)
-    response = httpx.Response(status_code, request=request, json=payload)
-    return httpx.HTTPStatusError(
-        f"upstream returned {status_code}",
-        request=request,
-        response=response,
-    )
-
-
-def test_flatten_newlines_preserves_words_without_literal_line_breaks() -> None:
-    assert adapter._flatten_newlines("alpha\r\nbeta\ngamma\rdelta") == (
-        "alpha beta gamma delta"
-    )
 
 
 @pytest.mark.asyncio
@@ -117,6 +102,8 @@ async def test_public_routes_generate_text_with_mapped_hef(
         "hef_path": str(hef_path),
         "messages": [{"role": "user", "content": "Say hello."}],
         "generation": {},
+        "tools": None,
+        "tool_choice": "auto",
     }]
 
 
@@ -182,7 +169,7 @@ async def test_unknown_model_details_return_not_found(
     assert response.status_code == 404
 
 
-def test_chat_payload_selects_the_configured_local_hef(
+def test_chat_translation_selects_the_configured_local_hef(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
@@ -190,21 +177,27 @@ def test_chat_payload_selects_the_configured_local_hef(
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
 
-    payload, _, response_model = adapter._build_payload(
+    model, messages, generation, tools, is_stream, response_model = (
+        adapter._build_inference_request(
         {
             "model": "public-id",
             "messages": [{"role": "user", "content": "hello"}],
         },
         default_stream=False,
+        )
     )
 
-    assert json.loads(payload)["model"] == str(hef_path)
+    assert model["hef_path"] == str(hef_path)
+    assert messages == [{"role": "user", "content": "hello"}]
+    assert generation == {}
+    assert tools is None
+    assert is_stream is False
     assert response_model == "public-id"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
-async def test_unknown_chat_model_is_rejected_before_upstream_call(
+async def test_unknown_chat_model_is_rejected_before_backend_call(
     path: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
@@ -213,10 +206,8 @@ async def test_unknown_chat_model_is_rejected_before_upstream_call(
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
 
-    async def unexpected_post(_body: bytes) -> dict[str, Any]:
-        raise AssertionError("unknown model must be rejected before inference")
-
-    monkeypatch.setattr(adapter, "_post_hailo", unexpected_post)
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
     transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
     async with httpx.AsyncClient(
         transport=transport,
@@ -228,48 +219,61 @@ async def test_unknown_chat_model_is_rejected_before_upstream_call(
         )
 
     assert response.status_code == 404
+    assert backend.requests == []
 
 
 @pytest.mark.asyncio
-async def test_discovery_does_not_wait_for_inference_slot(
+async def test_discovery_remains_responsive_during_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
     hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
     hef_path.touch()
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(hef_path)}))
-    await adapter._hailo_semaphore.acquire()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    backend = FakeInferenceBackend(started=started, release=release)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
     transport = httpx.ASGITransport(app=adapter.app)
 
-    try:
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://adapter",
-            timeout=1,
-        ) as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+        timeout=1,
+    ) as client:
+        request_task = asyncio.create_task(client.post(
+            "/api/chat",
+            json={
+                "model": "coder:1.5b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        ))
+        await started.wait()
+        try:
             response = await client.get("/api/tags")
-    finally:
-        adapter._hailo_semaphore.release()
+        finally:
+            release.set()
+            await request_task
 
     assert response.status_code == 200
     assert response.json()["models"][0]["name"] == "coder:1.5b"
 
 
 @pytest.mark.asyncio
-async def test_post_hailo_rejects_non_success_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(adapter.httpx, "AsyncClient", ErrorPostingAsyncClient)
-
-    with pytest.raises(httpx.HTTPStatusError) as exc_info:
-        await adapter._post_hailo(b"{}")
-
-    assert exc_info.value.response.status_code == 404
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/v1/chat/completions", "/api/chat"])
-async def test_chat_endpoint_preserves_upstream_status(
+@pytest.mark.parametrize(
+    ("error", "status_code"),
+    [
+        (BackendBusyError("queue full"), 503),
+        (BackendUnavailableError("backend failed"), 503),
+        (BackendTimeoutError("native generation continues"), 504),
+        (BackendGenerationError("native generation failed"), 502),
+    ],
+)
+async def test_chat_endpoint_reports_backend_state(
+    error: Exception,
+    status_code: int,
     path: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
