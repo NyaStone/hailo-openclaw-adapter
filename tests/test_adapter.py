@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 
 import httpx
@@ -15,6 +16,7 @@ from hailo_ollama_adapter.backend import (
     BackendGenerationError,
     BackendTimeoutError,
     BackendUnavailableError,
+    NativeHailoBackend,
 )
 
 
@@ -34,6 +36,14 @@ class FakeInferenceBackend:
         self.release = release
         self.status = {"status": "ready", "ready": True, "error": None, "queued": 0}
         self.requests: list[dict[str, Any]] = []
+        self.started_models: list[dict[str, Any]] | None = None
+        self.close_calls = 0
+
+    async def start(self, models: list[dict[str, Any]]) -> None:
+        self.started_models = models
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
     async def generate(
         self,
@@ -311,6 +321,51 @@ async def test_chat_endpoint_reports_backend_state(
 
 
 @pytest.mark.asyncio
+async def test_readiness_reflects_backend_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        ready = await client.get("/readyz")
+        backend.status = {
+            "status": "failed",
+            "ready": False,
+            "error": "device unavailable",
+            "queued": 0,
+        }
+        failed = await client.get("/readyz")
+
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    assert failed.status_code == 503
+    assert failed.json()["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_application_lifespan_owns_backend_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+
+    async with adapter.app.router.lifespan_context(adapter.app):
+        assert backend.started_models is not None
+        assert backend.started_models[0]["hef_path"] == str(hef_path)
+
+    assert backend.close_calls == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
 async def test_public_routes_preserve_conversation_for_injected_backend(
     path: str,
@@ -403,3 +458,51 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
         "top_p": 0.8,
         "max_generated_tokens": 64,
     }
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_release_native_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = NativeHailoBackend(queue_size=1, request_timeout=10)
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    active_calls = 0
+    maximum_active_calls = 0
+
+    def initialize(_model_paths: list[str]) -> None:
+        return None
+
+    def generate(_job: Any) -> str:
+        nonlocal active_calls, maximum_active_calls
+        with lock:
+            active_calls += 1
+            maximum_active_calls = max(maximum_active_calls, active_calls)
+        started.set()
+        release.wait(timeout=5)
+        with lock:
+            active_calls -= 1
+        return "complete"
+
+    monkeypatch.setattr(backend, "_initialize", initialize)
+    monkeypatch.setattr(backend, "_generate_native", generate)
+    await backend.start([{"hef_path": "fake.hef"}])
+
+    first = asyncio.create_task(backend.generate("fake.hef", [], {}))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(backend.generate("fake.hef", [], {}))
+        await asyncio.sleep(0)
+        with pytest.raises(BackendBusyError):
+            await backend.generate("fake.hef", [], {})
+        release.set()
+        assert await second == "complete"
+        assert maximum_active_calls == 1
+    finally:
+        release.set()
+        await backend.close()
