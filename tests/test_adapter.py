@@ -312,6 +312,7 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
     assert len(observed) == 1
     assert observed[0]["messages"] == messages
     assert observed[0]["tools"] == [tool_schema]
+    assert observed[0]["tool_choice"] == "auto"
     assert observed[0]["generation"] == {
         "temperature": 0.2,
         "top_p": 0.8,

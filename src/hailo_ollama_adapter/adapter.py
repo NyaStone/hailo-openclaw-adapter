@@ -33,22 +33,11 @@ HAILO_URL = "http://127.0.0.1:8000/api/chat"
 HAILO_HEADERS = {"Content-Type": "application/json"}
 
 REQUEST_TIMEOUT = 180.0
-MAX_USER_CONTENT_CHARS = 2000
-MAX_EXTRACTED_INTENT_CHARS = 500
-MAX_HISTORY_TURNS = 7
 MAX_CONCURRENT_HAILO_CALLS = 2
 MAX_UPSTREAM_ERROR_CHARS = 500
 MAX_STREAM_QUEUE_CHUNKS = 100
 
-FULL_TOOLING = """Tools available for this request:
-- read: Read file contents
-- write: Create or overwrite files
-- exec: Run shell commands (PTY available)
-- web_search: Search the web (Brave API)
-- You need to add your tools here"""
-
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_OPENCLAW_INTENT_RE = re.compile(r"\]\s*([^\n\r]+?)\s*$")
 
 logger = logging.getLogger(__name__)
 _hailo_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HAILO_CALLS)
@@ -138,15 +127,8 @@ def _encode_for_hailo(payload: dict) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
-# Message helpers
+# Conversation helpers
 # --------------------------------------------------------------------------- #
-
-def build_system_message(request_requires_tools: bool = False) -> dict:
-    base = "You are a personal assistant running inside OpenClaw. Use short answers"
-    if request_requires_tools:
-        base += "\n" + FULL_TOOLING
-    return {"role": "system", "content": _sanitize(base)}
-
 
 def _extract_text(content: Any) -> str:
     """Coerce OpenAI-style content (string or list of parts) to plain text."""
@@ -160,62 +142,45 @@ def _extract_text(content: Any) -> str:
 
 
 def normalize_messages(messages: list[dict]) -> list[dict]:
-    return [
-        {
-            "role": m.get("role", "user"),
-            "content": _sanitize(_extract_text(m.get("content", ""))),
-        }
-        for m in messages
-    ]
-
-
-def _extract_user_intent(raw: str) -> str:
-    """Pull the trailing user intent from an OpenClaw envelope, else flatten."""
-    match = _OPENCLAW_INTENT_RE.search(raw)
-    if match:
-        intent = match.group(1).strip()
-        if intent and len(intent) < MAX_EXTRACTED_INTENT_CHARS:
-            return intent
-    return _flatten_newlines(raw)
-
-
-def assemble_messages_for_hailo(incoming: list[dict]) -> list[dict]:
-    """Prepare messages for Hailo, working around known 5.3.0 quirks.
-
-    Keeps up to ``MAX_HISTORY_TURNS`` recent user/assistant turns so the
-    model has conversational context. Drops empty placeholders, flattens
-    newlines, extracts the actual user intent from the latest user turn,
-    and never emits a system role (Hailo rejects that on continuations).
-    """
-    turns = [
-        m for m in incoming
-        if m.get("role") in ("user", "assistant")
-        and m.get("content", "").strip()
-    ]
-    if not turns:
-        return [{"role": "user", "content": "hello"}]
-
-    recent = turns[-MAX_HISTORY_TURNS:]
-
-    # Conversations should start on a user turn
-    while recent and recent[0].get("role") != "user":
-        recent = recent[1:]
-    if not recent:
-        recent = [turns[-1]]
-
-    assembled = []
-    last_index = len(recent) - 1
-    for i, message in enumerate(recent):
-        raw = message.get("content", "")
-        is_latest_user = i == last_index and message.get("role") == "user"
-        content = (
-            _extract_user_intent(raw) if is_latest_user else _flatten_newlines(raw)
+    normalized = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        normalized_message = _deep_sanitize(message)
+        normalized_message["role"] = normalized_message.get("role", "user")
+        normalized_message["content"] = _sanitize(
+            _extract_text(message.get("content", ""))
         )
-        assembled.append({
-            "role": message["role"],
-            "content": content[:MAX_USER_CONTENT_CHARS],
-        })
-    return assembled
+        normalized.append(normalized_message)
+    return normalized
+
+
+_GENERATION_OPTION_ALIASES = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "frequency_penalty": "frequency_penalty",
+    "seed": "seed",
+    "do_sample": "do_sample",
+    "num_predict": "max_generated_tokens",
+    "max_generated_tokens": "max_generated_tokens",
+    "max_tokens": "max_generated_tokens",
+    "max_completion_tokens": "max_generated_tokens",
+}
+
+
+def _generation_options(request_data: dict) -> dict:
+    ollama_options = request_data.get("options")
+    sources = [
+        ollama_options if isinstance(ollama_options, dict) else {},
+        request_data,
+    ]
+    generation = {}
+    for source in sources:
+        for source_name, target_name in _GENERATION_OPTION_ALIASES.items():
+            if source_name in source:
+                generation[target_name] = _deep_sanitize(source[source_name])
+    return generation
 
 
 # --------------------------------------------------------------------------- #
@@ -313,14 +278,16 @@ def _build_payload(
     model = _find_configured_model(public_model_id)
     if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
-    messages = assemble_messages_for_hailo(
-        normalize_messages(request_data.get("messages", []))
-    )
-    body = _encode_for_hailo({
+    payload = {
         "model": model["hef_path"],
-        "messages": messages,
+        "messages": normalize_messages(request_data.get("messages", [])),
         "stream": is_stream,
-    })
+        "generation": _generation_options(request_data),
+    }
+    for field in ("tools", "tool_choice"):
+        if field in request_data:
+            payload[field] = _deep_sanitize(request_data[field])
+    body = _encode_for_hailo(payload)
     return body, is_stream, public_model_id
 
 
