@@ -146,6 +146,7 @@ def to_openai_chunk(
     model: str,
     finish_reason: str | None = None,
     is_role_header: bool = False,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> str:
     now = int(time.time())
     delta = (
@@ -153,6 +154,8 @@ def to_openai_chunk(
         if is_role_header
         else {"content": content}
     )
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
     chunk = {
         "id": f"chatcmpl-{now}",
         "object": "chat.completion.chunk",
@@ -338,10 +341,6 @@ async def _run_chat_request(
         generated,
         chat_request.tool_inventory if chat_request.tool_choice == "auto" else {},
     )
-    if chat_request.stream and result.tool_calls:
-        raise BackendGenerationError(
-            "Streaming tool calls are not supported by this endpoint yet"
-        )
     return chat_request, result
 
 
@@ -548,23 +547,40 @@ async def _get_model_details(name: str) -> dict:
 # Streaming generators
 # --------------------------------------------------------------------------- #
 
-async def _stream_openai(content: str, model: str) -> AsyncIterator[str]:
-    """Frame a completed native text generation as OpenAI SSE."""
+async def _stream_openai(result: ChatResult, model: str) -> AsyncIterator[str]:
+    """Frame a completed native generation as OpenAI SSE."""
     yield to_openai_chunk("", model, is_role_header=True)
-    if content:
-        yield to_openai_chunk(content, model)
-    yield to_openai_chunk("", model, finish_reason="stop")
+    if result.content:
+        yield to_openai_chunk(result.content, model)
+    for index, call in enumerate(result.tool_calls):
+        yield to_openai_chunk(
+            "",
+            model,
+            tool_calls=[{
+                "index": index,
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": json.dumps(
+                        call["arguments"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            }],
+        )
+    yield to_openai_chunk(
+        "",
+        model,
+        finish_reason="tool_calls" if result.tool_calls else "stop",
+    )
     yield "data: [DONE]\n\n"
 
 
-async def _stream_ollama(content: str, model: str) -> AsyncIterator[str]:
-    """Frame a completed native text generation as Ollama NDJSON."""
-    yield json.dumps({
-        "model": model,
-        "created_at": f"{int(time.time())}",
-        "message": {"role": "assistant", "content": content},
-        "done": True,
-    }) + "\n"
+async def _stream_ollama(result: ChatResult, model: str) -> AsyncIterator[str]:
+    """Frame a completed native generation as Ollama NDJSON."""
+    yield json.dumps(_ollama_full_response(result, model)) + "\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -583,7 +599,7 @@ async def chat_completions(request: Request) -> Any:
         )
         if chat_request.stream:
             return StreamingResponse(
-                _stream_openai(result.content, chat_request.public_model_id),
+                _stream_openai(result, chat_request.public_model_id),
                 media_type="text/event-stream",
             )
         return _openai_full_response(result, chat_request.public_model_id)
@@ -701,7 +717,7 @@ async def api_chat(request: Request) -> Any:
         )
         if chat_request.stream:
             return StreamingResponse(
-                _stream_ollama(result.content, chat_request.public_model_id),
+                _stream_ollama(result, chat_request.public_model_id),
                 media_type="application/x-ndjson",
             )
         return _ollama_full_response(result, chat_request.public_model_id)
