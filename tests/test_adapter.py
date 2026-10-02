@@ -133,6 +133,10 @@ async def _start_fake_native_backend(
 ) -> NativeHailoBackend:
     def initialize(backend: NativeHailoBackend, model_paths: list[str]) -> None:
         backend._models = dict.fromkeys(model_paths, native_llm)
+        backend._model_context_lengths = dict.fromkeys(
+            model_paths,
+            native_llm.max_context_capacity(),
+        )
 
     monkeypatch.setattr(NativeHailoBackend, "_initialize", initialize)
     backend = NativeHailoBackend()
@@ -571,14 +575,10 @@ async def test_discovery_lists_only_configured_usable_hefs(
         base_url="http://adapter",
     ) as client:
         tags = await client.get("/api/tags")
-        details = await client.post("/api/show", json={"model": "coder:1.5b"})
 
     assert tags.status_code == 200
-    assert details.status_code == 200
     assert [model["name"] for model in tags.json()["models"]] == ["coder:1.5b"]
-    assert details.json()["details"]["format"] == "hef"
-    assert details.json()["model_info"]["qwen2.context_length"] == 2048
-    assert details.json()["capabilities"] == ["completion", "tools"]
+    assert tags.json()["models"][0]["details"] == {"format": "hef"}
 
 
 def test_discovery_uses_installed_hailo_apps_agent_models(
@@ -639,7 +639,7 @@ async def test_api_show_reports_loaded_hef_context_capacity(
         backend._model_context_lengths = dict.fromkeys(model_paths, 4096)
 
     monkeypatch.setattr(NativeHailoBackend, "_initialize", initialize)
-    monkeypatch.delattr(adapter.app.state, "inference_backend", raising=False)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", None, raising=False)
     transport = httpx.ASGITransport(app=adapter.app)
 
     async with adapter._lifespan(adapter.app):
@@ -656,22 +656,15 @@ async def test_api_show_reports_loaded_hef_context_capacity(
     assert response.json()["model_info"] == {"hailo.context_length": 4096}
 
 
-@pytest.mark.asyncio
-async def test_discovery_omits_unusable_hefs_without_fallback(
+def test_discovery_errors_when_configured_hef_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
     missing_hef = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
     monkeypatch.setenv("HAILO_MODELS", json.dumps({"coder:1.5b": str(missing_hef)}))
-    transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://adapter",
-    ) as client:
-        response = await client.get("/api/tags")
-
-    assert response.json() == {"models": []}
+    with pytest.raises(RuntimeError, match="No installed LLM HEFs"):
+        adapter._configured_models()
 
 
 @pytest.mark.asyncio
@@ -1555,8 +1548,8 @@ async def test_cancelled_waiter_does_not_release_native_worker(
     active_calls = 0
     maximum_active_calls = 0
 
-    def initialize(_model_paths: list[str]) -> None:
-        return None
+    def initialize(model_paths: list[str]) -> None:
+        backend._model_context_lengths = dict.fromkeys(model_paths, 4096)
 
     def generate(_job: Any) -> str:
         nonlocal active_calls, maximum_active_calls
