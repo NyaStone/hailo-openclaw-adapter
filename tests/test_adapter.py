@@ -189,10 +189,16 @@ async def test_streaming_routes_terminate_with_protocol_marker(
         assert records[-1]["done"] is True
         assert records[-1]["message"]["content"] == "Streamed answer."
     else:
-        events = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
+        events = [
+            line[6:]
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
         assert events[-1] == "[DONE]"
         chunks = [json.loads(event) for event in events[:-1]]
-        content = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+        content = "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+        )
         assert content == "Streamed answer."
 
 
