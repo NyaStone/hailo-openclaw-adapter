@@ -28,6 +28,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.100",
+    "jsonschema>=4.18",
     "uvicorn[standard]>=0.24",
 ]
 

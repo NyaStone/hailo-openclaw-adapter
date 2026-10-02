@@ -163,10 +163,6 @@ def to_openai_chunk(
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def _openai_full_response(content: str, model: str) -> dict:
-    raise NotImplementedError
-
-
 def _openai_full_response(result: ChatResult, model: str) -> dict:
     now = int(time.time())
     message: dict[str, Any] = {
@@ -248,7 +244,11 @@ class ChatResult:
 def _validate_tool_inventory(tools: list[dict] | None) -> dict[str, dict]:
     inventory = {}
     for tool in tools or []:
-        if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type", "function") != "function"
+            or not isinstance(tool.get("function"), dict)
+        ):
             raise HTTPException(status_code=400, detail="Each tool must define a function")
         function = tool["function"]
         name = function.get("name")
@@ -558,16 +558,16 @@ async def _stream_ollama(content: str, model: str) -> AsyncIterator[str]:
 async def chat_completions(request: Request) -> Any:
     """Serve OpenAI chat completions, defaulting requests to non-streaming."""
     try:
-        chat_request, content = await _run_chat_request(
+        chat_request, result = await _run_chat_request(
             await request.json(),
             default_stream=False,
         )
         if chat_request.stream:
             return StreamingResponse(
-                _stream_openai(content, chat_request.public_model_id),
+                _stream_openai(result.content, chat_request.public_model_id),
                 media_type="text/event-stream",
             )
-        return _openai_full_response(content, chat_request.public_model_id)
+        return _openai_full_response(result, chat_request.public_model_id)
     except HTTPException:
         raise
     except (BackendBusyError, BackendUnavailableError, BackendTimeoutError,
@@ -676,16 +676,16 @@ async def api_show(request: Request) -> dict:
 async def api_chat(request: Request) -> Any:
     """ Serve Ollama chat requests, defaulting to NDJSON streaming."""
     try:
-        chat_request, content = await _run_chat_request(
+        chat_request, result = await _run_chat_request(
             await request.json(),
             default_stream=True,
         )
         if chat_request.stream:
             return StreamingResponse(
-                _stream_ollama(content, chat_request.public_model_id),
+                _stream_ollama(result.content, chat_request.public_model_id),
                 media_type="application/x-ndjson",
             )
-        return _ollama_full_response(content, chat_request.public_model_id)
+        return _ollama_full_response(result, chat_request.public_model_id)
     except HTTPException:
         raise
     except (BackendBusyError, BackendUnavailableError, BackendTimeoutError,
