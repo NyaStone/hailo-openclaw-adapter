@@ -172,7 +172,10 @@ def _validate_text_only_messages(request_data: dict) -> None:
         raise HTTPException(status_code=400, detail="messages must be a list")
     for message in messages:
         if not isinstance(message, dict):
-            raise HTTPException(status_code=400, detail="Each message must be an object")
+            raise HTTPException(
+                status_code=400,
+                detail="Each message must be an object",
+            )
         if any(message.get(field) for field in ("images", "audio", "video")):
             raise HTTPException(status_code=400, detail="Unsupported media in message")
         content = message.get("content", "")

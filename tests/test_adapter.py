@@ -75,6 +75,64 @@ class FakeInferenceBackend:
         return response
 
 
+class FakeNativeCompletion:
+    def __init__(self, response: str, status_name: str) -> None:
+        self.response = response
+        self.generation_status = type("Status", (), {"name": status_name})()
+
+    def __enter__(self) -> FakeNativeCompletion:
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        return None
+
+    def read_all(self, timeout_ms: int) -> str:
+        return self.response
+
+
+class FakeNativeLLM:
+    def __init__(self, capacity: int = 10000, status_name: str = "LOGICAL_END_OF_GENERATION") -> None:
+        self.capacity = capacity
+        self.status_name = status_name
+        self.tokenized_prompt = ""
+        self.generate_calls: list[dict[str, Any]] = []
+
+    def clear_context(self) -> None:
+        return None
+
+    def prompt_template(self) -> str:
+        return "{{ messages }}|TOOLS={{ tools }}|ASSISTANT"
+
+    def tokenize(self, text: str) -> list[str]:
+        self.tokenized_prompt = text
+        return text.split()
+
+    def max_context_capacity(self) -> int:
+        return self.capacity
+
+    def generate(self, prompt: list[dict[str, Any]], **arguments: Any) -> FakeNativeCompletion:
+        self.generate_calls.append({"prompt": prompt, "arguments": arguments})
+        return FakeNativeCompletion("Native response.", self.status_name)
+
+    def release(self) -> None:
+        return None
+
+
+async def _start_fake_native_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    hef_path: str,
+    native_llm: FakeNativeLLM,
+) -> NativeHailoBackend:
+    def initialize(backend: NativeHailoBackend, model_paths: list[str]) -> None:
+        backend._models = {path: native_llm for path in model_paths}
+
+    monkeypatch.setattr(NativeHailoBackend, "_initialize", initialize)
+    backend = NativeHailoBackend()
+    await backend.start([{"hef_path": hef_path}])
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    return backend
+
+
 def test_native_response_removes_qwen_end_marker() -> None:
     assert _clean_generated_text("A short answer.<|im_end|>") == "A short answer."
 
@@ -450,7 +508,10 @@ async def test_required_and_forced_tool_choices_return_matching_calls(
     ]
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post(
             path,
             json={
@@ -465,7 +526,8 @@ async def test_required_and_forced_tool_choices_return_matching_calls(
     assert response.status_code == 200
     assert backend.requests[0]["tools"] == tools
     if path == "/api/chat":
-        assert response.json()["message"]["tool_calls"][0]["function"]["name"] == expected_name
+        call = response.json()["message"]["tool_calls"][0]
+        assert call["function"]["name"] == expected_name
     elif stream:
         data_events = [
             line[6:]
@@ -482,7 +544,8 @@ async def test_required_and_forced_tool_choices_return_matching_calls(
         assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
     else:
         assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
-        assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == expected_name
+        call = response.json()["choices"][0]["message"]["tool_calls"][0]
+        assert call["function"]["name"] == expected_name
 
 
 @pytest.mark.asyncio
@@ -930,7 +993,10 @@ async def test_text_only_models_reject_unsupported_media(
     monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post(
             path,
             json={"model": "configured", "messages": messages},
@@ -972,7 +1038,10 @@ async def test_unsupported_generation_options_are_rejected(
         payload[field] = value
     transport = httpx.ASGITransport(app=adapter.app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post(path, json=payload)
 
     assert response.status_code == 400
@@ -1020,7 +1089,10 @@ async def test_required_and_forced_tool_choices_cannot_succeed_without_matching_
     ]
     transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post(
             path,
             json={
@@ -1045,8 +1117,14 @@ async def test_required_and_forced_tool_choices_cannot_succeed_without_matching_
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
-        (BackendContextOverflowError("Prompt and output allowance exceed context capacity"), {"error": "Prompt and output allowance exceed context capacity", "code": "context_length_exceeded"}),
-        (BackendOutputExhaustedError("Generation stopped at the output token limit"), {"error": "Generation stopped at the output token limit", "code": "output_limit_exceeded"}),
+        (
+            BackendContextOverflowError("context overflow"),
+            {"error": "context overflow", "code": "context_length_exceeded"},
+        ),
+        (
+            BackendOutputExhaustedError("output exhausted"),
+            {"error": "output exhausted", "code": "output_limit_exceeded"},
+        ),
     ],
 )
 async def test_limit_failures_have_matching_meaning_for_all_response_modes(
@@ -1064,7 +1142,10 @@ async def test_limit_failures_have_matching_meaning_for_all_response_modes(
     monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
     transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
         response = await client.post(
             path,
             json={
@@ -1074,11 +1155,118 @@ async def test_limit_failures_have_matching_meaning_for_all_response_modes(
             },
         )
 
-    assert response.status_code == (413 if isinstance(error, BackendContextOverflowError) else 502)
+    expected_status = 413 if isinstance(error, BackendContextOverflowError) else 502
+    assert response.status_code == expected_status
     assert response.json() == expected
     assert response.headers["content-type"].startswith("application/json")
     assert "[DONE]" not in response.text
     assert '"done": true' not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_native_context_budget_counts_full_transcript_and_tool_schema(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    native_llm = FakeNativeLLM(capacity=1)
+    backend = await _start_fake_native_backend(monkeypatch, str(hef_path), native_llm)
+    messages = [
+        {"role": "system", "content": "Preserve the system instruction."},
+        {"role": "user", "content": "Earlier transcript details stay present."},
+        {"role": "user", "content": "Final question."},
+    ]
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "lookup_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }]
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://adapter",
+        ) as client:
+            response = await client.post(
+                path,
+                json={
+                    "model": "configured",
+                    "messages": messages,
+                    "tools": tools,
+                    "max_tokens": 12,
+                },
+            )
+    finally:
+        await backend.close()
+
+    assert response.status_code == 413
+    detail = response.json()["error"]
+    assert "Rendered prompt" in detail
+    assert "output allowance (12 tokens)" in detail
+    assert "capacity (1)" in detail
+    assert "Preserve the system instruction." in native_llm.tokenized_prompt
+    assert "Earlier transcript details stay present." in native_llm.tokenized_prompt
+    assert "Final question." in native_llm.tokenized_prompt
+    assert "lookup_weather" in native_llm.tokenized_prompt
+    assert "city" in native_llm.tokenized_prompt
+    assert native_llm.generate_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+@pytest.mark.parametrize(
+    ("status_name", "expected_status", "expected_code"),
+    [
+        ("LOGICAL_END_OF_GENERATION", 200, None),
+        ("MAX_TOKENS_REACHED", 502, "output_limit_exceeded"),
+    ],
+)
+async def test_native_terminal_status_controls_public_success(
+    path: str,
+    status_name: str,
+    expected_status: int,
+    expected_code: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    native_llm = FakeNativeLLM(status_name=status_name)
+    backend = await _start_fake_native_backend(monkeypatch, str(hef_path), native_llm)
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://adapter",
+        ) as client:
+            response = await client.post(
+                path,
+                json={
+                    "model": "configured",
+                    "messages": [{"role": "user", "content": "Answer."}],
+                    "max_tokens": 8,
+                },
+            )
+    finally:
+        await backend.close()
+
+    assert response.status_code == expected_status
+    if expected_code is None:
+        assert response.status_code == 200
+    else:
+        assert response.json()["code"] == expected_code
 
 
 @pytest.mark.asyncio
