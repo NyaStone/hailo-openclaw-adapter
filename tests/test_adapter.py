@@ -226,6 +226,7 @@ def test_chat_translation_selects_the_configured_local_hef(
         messages,
         generation,
         tools,
+        tool_choice,
         is_stream,
         response_model,
     ) = adapter._build_inference_request(
@@ -240,6 +241,7 @@ def test_chat_translation_selects_the_configured_local_hef(
     assert messages == [{"role": "user", "content": "hello"}]
     assert generation == {}
     assert tools is None
+    assert tool_choice == "auto"
     assert is_stream is False
     assert response_model == "public-id"
 
