@@ -98,18 +98,44 @@ def _extract_text(content: Any) -> str:
     if isinstance(content, list):
         return " ".join(
             item.get("text", "")
-            # Inference request translation
+            for item in content
             if isinstance(item, dict) and item.get("type") == "text"
         )
-            def _build_inference_request(
+    return content if isinstance(content, str) else str(content)
+
+
+def normalize_messages(messages: list[dict]) -> list[dict]:
+    normalized = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        normalized_message = _deep_sanitize(message)
+        normalized_message["role"] = normalized_message.get("role", "user")
+        normalized_message["content"] = _sanitize(
+            _extract_text(message.get("content", ""))
+        )
+        normalized.append(normalized_message)
+    return normalized
+
+
+_GENERATION_OPTION_ALIASES = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "frequency_penalty": "frequency_penalty",
+    "seed": "seed",
+    "do_sample": "do_sample",
+    "num_predict": "max_generated_tokens",
+    "max_generated_tokens": "max_generated_tokens",
+    "max_tokens": "max_generated_tokens",
+    "max_completion_tokens": "max_generated_tokens",
+}
+
+
 def _generation_options(request_data: dict) -> dict:
     ollama_options = request_data.get("options")
-            ) -> tuple[dict, list[dict], dict, list[dict] | None, bool, str]:
-                if not isinstance(request_data, dict):
-                    raise HTTPException(status_code=400, detail="A JSON object is required")
+    sources = [
         ollama_options if isinstance(ollama_options, dict) else {},
-                if not isinstance(is_stream, bool):
-                    raise HTTPException(status_code=400, detail="stream must be a boolean")
         request_data,
     ]
     generation = {}
@@ -171,44 +197,18 @@ def _ollama_full_response(content: str, model: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Hailo client
+# Direct inference request translation
 # --------------------------------------------------------------------------- #
 
-
-def _upstream_error_detail(response: httpx.Response) -> str:
-    """Extract a bounded explicit error without reflecting arbitrary bodies."""
-    detail: Any = None
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, ValueError):
-        payload = None
-
-    if isinstance(payload, dict):
-        detail = payload.get("error") or payload.get("detail")
-        if isinstance(detail, dict):
-            detail = detail.get("message")
-
-    if not isinstance(detail, str) or not detail.strip():
-        return f"Hailo upstream returned HTTP {response.status_code}"
-
-    return _flatten_newlines(_sanitize(detail)).strip()[:MAX_UPSTREAM_ERROR_CHARS]
-
-
-def _upstream_error_response(exc: httpx.HTTPStatusError) -> JSONResponse:
-    """Preserve Hailo's status with a bounded downstream error response."""
-    status = exc.response.status_code
-    logger.warning("Hailo upstream rejected chat request: status=%d", status)
-    return JSONResponse(
-        status_code=status,
-        content={"error": _upstream_error_detail(exc.response)},
-    )
-
-
-def _build_payload(
+def _build_inference_request(
     request_data: dict,
     default_stream: bool,
-) -> tuple[bytes, bool, str]:
+) -> tuple[dict, list[dict], dict, list[dict] | None, bool, str]:
+    if not isinstance(request_data, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required")
     is_stream = request_data.get("stream", default_stream)
+    if not isinstance(is_stream, bool):
+        raise HTTPException(status_code=400, detail="stream must be a boolean")
     public_model_id = request_data.get("model")
     if not isinstance(public_model_id, str) or not public_model_id:
         raise HTTPException(status_code=400, detail="A model ID is required")
