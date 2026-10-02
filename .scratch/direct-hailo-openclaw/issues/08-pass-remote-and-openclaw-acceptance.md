@@ -32,3 +32,9 @@
 ### Blocker
 
 The model discovery and public API checks pass, but OpenClaw refuses to start an agent turn with the truthful 2,048-token HEF profile. Consequently no streamed schema-driven call, tool execution, synthetic result replay, or grounded final answer was completed. Do not raise the configured context above the HEF's measured capacity to bypass OpenClaw's minimum. Resume acceptance only with a validated supported HEF profile of at least 4,000 tokens or an OpenClaw version that supports this model's actual context.
+
+### Discovery Follow-up
+
+The former `_VALIDATED_HEF_PROFILES` allowlist was the source of `/api/show` metadata. Its 2,048-token value happened to match the compiled Qwen HEF, but it did not discover other framework models and could not establish a model-family context limit. Discovery now uses Hailo Apps' `agent` catalog and installed resource paths without invoking its downloader; HailoRT's loaded `LLM.max_context_capacity()` supplies the reported context. A direct HailoRT probe and the live adapter both reported 2,048 for this HEF, so the base Qwen 32k context does not remove the OpenClaw 4k-minimum blocker.
+
+On branch `tickets/08`, code commit `ffbb0b6` passed the focused discovery/lifecycle slice (`10 passed`), full suite (`89 passed`), and `ruff check src tests`. With `HAILO_MODELS` unset, framework discovery listed `Qwen2.5-Coder-1.5B-Instruct`; live `/readyz`, `/api/tags`, and `/api/show` returned 200, and `/api/show` reported `hailo.context_length=2048`. No OpenClaw tool-flow acceptance was performed by this follow-up.
