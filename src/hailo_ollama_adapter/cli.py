@@ -34,7 +34,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit-concurrency",
         type=int,
         default=2,
-        help="Max concurrent HTTP connections; inference remains serialized (default: 2).",
+        help=(
+            "Max concurrent HTTP connections; inference remains serialized "
+            "(default: 2)."
+        ),
     )
     parser.add_argument(
         "--queue-size",
