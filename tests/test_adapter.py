@@ -26,12 +26,13 @@ class FakeInferenceBackend:
 
     def __init__(
         self,
-        response: str = "Hailo says hello.",
+        response: str | list[str] = "Hailo says hello.",
         error: Exception | None = None,
         started: Any = None,
         release: Any = None,
     ) -> None:
-        self.response = response
+        self.responses = response if isinstance(response, list) else [response]
+        self.response_index = 0
         self.error = error
         self.started = started
         self.release = release
@@ -67,7 +68,9 @@ class FakeInferenceBackend:
             await self.release.wait()
         if self.error is not None:
             raise self.error
-        return self.response
+        response = self.responses[min(self.response_index, len(self.responses) - 1)]
+        self.response_index += 1
+        return response
 
 
 def test_native_response_removes_qwen_end_marker() -> None:
@@ -533,6 +536,274 @@ async def test_public_routes_preserve_conversation_for_injected_backend(
         "top_p": 0.8,
         "max_generated_tokens": 64,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+async def test_public_routes_return_validated_tool_calls(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(
+        response=(
+            'Checking now. <tool_call>{"name":"lookup_weather",'
+            '"arguments":{"city":"Testville"}}</tool_call>'
+            '<tool_call>{"name":"lookup_time",'
+            '"arguments":{"timezone":"UTC"}}</tool_call>'
+        ),
+    )
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_time",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                    "required": ["timezone"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Check weather and time."}],
+                "tools": tools,
+                "stream": False,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    if path == "/api/chat":
+        calls = payload["message"]["tool_calls"]
+        assert payload["message"]["content"] == "Checking now."
+        assert [call["function"] for call in calls] == [
+            {"name": "lookup_weather", "arguments": {"city": "Testville"}},
+            {"name": "lookup_time", "arguments": {"timezone": "UTC"}},
+        ]
+    else:
+        choice = payload["choices"][0]
+        calls = choice["message"]["tool_calls"]
+        assert choice["message"]["content"] == "Checking now."
+        assert choice["finish_reason"] == "tool_calls"
+        assert [
+            {"name": call["function"]["name"],
+             "arguments": json.loads(call["function"]["arguments"])}
+            for call in calls
+        ] == [
+            {"name": "lookup_weather", "arguments": {"city": "Testville"}},
+            {"name": "lookup_time", "arguments": {"timezone": "UTC"}},
+        ]
+    assert len({call["id"] for call in calls}) == 2
+    assert all(call["id"].startswith("call_") for call in calls)
+    assert backend.requests[0]["tools"] == tools
+
+
+@pytest.mark.asyncio
+async def test_tool_result_replay_continues_with_fresh_request_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(response=[
+        '<tool_call>{"name":"lookup_weather",'
+        '"arguments":{"city":"Testville"}}</tool_call>',
+        "It is 17 degrees and raining in Testville.",
+    ])
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "lookup_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }]
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        first = await client.post(
+            "/api/chat",
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": tools,
+                "stream": False,
+            },
+        )
+        first_call = first.json()["message"]["tool_calls"][0]
+        replay_messages = [
+            {"role": "user", "content": "What's the weather?"},
+            {"role": "assistant", "content": "", "tool_calls": [first_call]},
+            {
+                "role": "tool",
+                "tool_call_id": first_call["id"],
+                "name": "lookup_weather",
+                "content": '{"temperature_c":17,"condition":"light rain"}',
+            },
+        ]
+        second = await client.post(
+            "/api/chat",
+            json={
+                "model": "configured",
+                "messages": replay_messages,
+                "tools": tools,
+                "stream": False,
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["message"]["content"] == (
+        "It is 17 degrees and raining in Testville."
+    )
+    assert backend.requests[1]["messages"] == replay_messages
+    assert backend.requests[1]["tools"] == tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "generated",
+    [
+        '<tool_call>{"name":"lookup_weather","arguments":{"city":"X"}}',
+        '<tool_call>{"name":"unknown_tool","arguments":{}}</tool_call>',
+        '<tool_call>{"name":"lookup_weather","arguments":{}}</tool_call>',
+        '<tool_call>{not json}</tool_call>',
+    ],
+)
+async def test_invalid_tool_calls_fail_instead_of_returning_text(
+    generated: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(response=generated)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }],
+                "stream": False,
+            },
+        )
+
+    assert response.status_code == 502
+    assert "tool" in response.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_tool_inventory_is_isolated_between_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(response=[
+        '<tool_call>{"name":"lookup_weather",'
+        '"arguments":{"city":"X"}}</tool_call>',
+        '<tool_call>{"name":"lookup_weather",'
+        '"arguments":{"city":"X"}}</tool_call>',
+    ])
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+    common = {
+        "model": "configured",
+        "messages": [{"role": "user", "content": "Call a tool."}],
+        "stream": False,
+    }
+    weather_tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup_weather",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"},
+            }},
+        },
+    }
+    time_tool = {
+        "type": "function",
+        "function": {
+            "name": "lookup_time",
+            "parameters": {"type": "object", "properties": {
+                "timezone": {"type": "string"},
+            }},
+        },
+    }
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://adapter",
+    ) as client:
+        first = await client.post(
+            "/api/chat",
+            json={**common, "tools": [weather_tool]},
+        )
+        second = await client.post(
+            "/api/chat",
+            json={**common, "tools": [time_tool]},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 502
+    assert backend.requests[0]["tools"] == [weather_tool]
+    assert backend.requests[1]["tools"] == [time_tool]
 
 
 @pytest.mark.asyncio
