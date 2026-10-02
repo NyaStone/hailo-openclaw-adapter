@@ -13,7 +13,9 @@ import pytest
 from hailo_ollama_adapter import adapter
 from hailo_ollama_adapter.backend import (
     BackendBusyError,
+    BackendContextOverflowError,
     BackendGenerationError,
+    BackendOutputExhaustedError,
     BackendTimeoutError,
     BackendUnavailableError,
     NativeHailoBackend,
@@ -410,6 +412,77 @@ async def test_streaming_generation_failure_has_no_success_terminal_marker(
     assert response.headers["content-type"].startswith("application/json")
     assert "[DONE]" not in response.text
     assert '"done": true' not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("tool_choice", "expected_name"),
+    [
+        ("required", "lookup_weather"),
+        ({"type": "function", "function": {"name": "lookup_time"}}, "lookup_time"),
+    ],
+)
+async def test_required_and_forced_tool_choices_return_matching_calls(
+    path: str,
+    stream: bool,
+    tool_choice: Any,
+    expected_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(
+        response=(
+            f'<tool_call>{{"name":"{expected_name}","arguments":{{}}}}</tool_call>'
+        ),
+    )
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in ("lookup_weather", "lookup_time")
+    ]
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Look it up."}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "stream": stream,
+            },
+        )
+
+    assert response.status_code == 200
+    assert backend.requests[0]["tools"] == tools
+    if path == "/api/chat":
+        assert response.json()["message"]["tool_calls"][0]["function"]["name"] == expected_name
+    elif stream:
+        data_events = [
+            line[6:]
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        chunks = [json.loads(event) for event in data_events]
+        calls = [
+            call
+            for chunk in chunks
+            for call in chunk["choices"][0]["delta"].get("tool_calls", [])
+        ]
+        assert calls[0]["function"]["name"] == expected_name
+        assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+        assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == expected_name
 
 
 @pytest.mark.asyncio
@@ -831,6 +904,179 @@ async def test_public_routes_return_validated_tool_calls(
     assert len({call["id"] for call in calls}) == 2
     assert all(call["id"].startswith("call_") for call in calls)
     assert backend.requests[0]["tools"] == tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}]}],
+        [{"role": "user", "content": [{"type": "audio", "data": "AAAA"}]}],
+    ],
+)
+async def test_text_only_models_reject_unsupported_media(
+    path: str,
+    messages: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.post(
+            path,
+            json={"model": "configured", "messages": messages},
+        )
+
+    assert response.status_code == 400
+    assert "media" in response.json()["detail"].lower()
+    assert backend.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("presence_penalty", 0.5), ("response_format", {"type": "json_object"})],
+)
+async def test_unsupported_generation_options_are_rejected(
+    path: str,
+    stream: bool,
+    field: str,
+    value: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend()
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    payload: dict[str, Any] = {
+        "model": "configured",
+        "messages": [{"role": "user", "content": "Answer."}],
+        "stream": stream,
+    }
+    if path == "/api/chat":
+        payload["options"] = {field: value}
+    else:
+        payload[field] = value
+    transport = httpx.ASGITransport(app=adapter.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.post(path, json=payload)
+
+    assert response.status_code == 400
+    assert field in response.json()["detail"]
+    assert backend.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("tool_choice", "response_body"),
+    [
+        ("required", "No tool call was generated for required choice"),
+        (
+            {"type": "function", "function": {"name": "lookup_time"}},
+            "Generated tool call does not match the forced tool",
+        ),
+    ],
+)
+async def test_required_and_forced_tool_choices_cannot_succeed_without_matching_calls(
+    path: str,
+    stream: bool,
+    tool_choice: Any,
+    response_body: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    generated = (
+        '<tool_call>{"name":"lookup_weather","arguments":{}}</tool_call>'
+        if isinstance(tool_choice, dict)
+        else "A plain-text answer."
+    )
+    backend = FakeInferenceBackend(response=generated)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in ("lookup_weather", "lookup_time")
+    ]
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Check the weather."}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "stream": stream,
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == response_body
+    assert response.headers["content-type"].startswith("application/json")
+    assert "[DONE]" not in response.text
+    assert '"done": true' not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (BackendContextOverflowError("Prompt and output allowance exceed context capacity"), {"error": "Prompt and output allowance exceed context capacity", "code": "context_length_exceeded"}),
+        (BackendOutputExhaustedError("Generation stopped at the output token limit"), {"error": "Generation stopped at the output token limit", "code": "output_limit_exceeded"}),
+    ],
+)
+async def test_limit_failures_have_matching_meaning_for_all_response_modes(
+    path: str,
+    stream: bool,
+    error: Exception,
+    expected: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"configured": str(hef_path)}))
+    backend = FakeInferenceBackend(error=error)
+    monkeypatch.setattr(adapter.app.state, "inference_backend", backend, raising=False)
+    transport = httpx.ASGITransport(app=adapter.app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://adapter") as client:
+        response = await client.post(
+            path,
+            json={
+                "model": "configured",
+                "messages": [{"role": "user", "content": "Answer."}],
+                "stream": stream,
+            },
+        )
+
+    assert response.status_code == (413 if isinstance(error, BackendContextOverflowError) else 502)
+    assert response.json() == expected
+    assert response.headers["content-type"].startswith("application/json")
+    assert "[DONE]" not in response.text
+    assert '"done": true' not in response.text
 
 
 @pytest.mark.asyncio

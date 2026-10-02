@@ -26,7 +26,9 @@ from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from hailo_ollama_adapter.backend import (
     BackendBusyError,
+    BackendContextOverflowError,
     BackendGenerationError,
+    BackendOutputExhaustedError,
     BackendTimeoutError,
     BackendUnavailableError,
     NativeHailoBackend,
@@ -122,6 +124,90 @@ _GENERATION_OPTION_ALIASES = {
     "max_completion_tokens": "max_generated_tokens",
 }
 
+_UNSUPPORTED_GENERATION_OPTIONS = {
+    "format",
+    "logit_bias",
+    "logprobs",
+    "n",
+    "presence_penalty",
+    "response_format",
+    "stop",
+    "top_logprobs",
+}
+
+
+def _validate_request_options(request_data: dict) -> None:
+    ollama_options = request_data.get("options")
+    if ollama_options is not None and not isinstance(ollama_options, dict):
+        raise HTTPException(status_code=400, detail="options must be an object")
+    if isinstance(ollama_options, dict):
+        unsupported = set(ollama_options) - set(_GENERATION_OPTION_ALIASES)
+        if unsupported:
+            option = sorted(unsupported)[0]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported generation option: {option}",
+            )
+    for option in _UNSUPPORTED_GENERATION_OPTIONS:
+        if option in request_data:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported generation option: {option}",
+            )
+
+
+def _validate_text_only_messages(request_data: dict) -> None:
+    if request_data.get("images"):
+        raise HTTPException(status_code=400, detail="Unsupported media: images")
+    messages = request_data.get("messages", [])
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
+    for message in messages:
+        if not isinstance(message, dict):
+            raise HTTPException(status_code=400, detail="Each message must be an object")
+        content = message.get("content", "")
+        if isinstance(content, list) and any(
+            not isinstance(part, dict)
+            or part.get("type") != "text"
+            or not isinstance(part.get("text"), str)
+            for part in content
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported media: this model accepts text only",
+            )
+
+
+def _normalize_tool_choice(value: Any, inventory: dict[str, dict]) -> str:
+    if value in ("auto", "none", "required"):
+        choice = value
+    elif (
+        isinstance(value, dict)
+        and value.get("type") == "function"
+        and isinstance(value.get("function"), dict)
+        and isinstance(value["function"].get("name"), str)
+    ):
+        name = value["function"]["name"]
+        if not name:
+            raise HTTPException(status_code=400, detail="Forced tool name is required")
+        if name not in inventory:
+            raise HTTPException(
+                status_code=400,
+                detail="Forced tool name must match a declared tool",
+            )
+        choice = f"forced:{name}"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="tool_choice must be auto, none, required, or a forced function",
+        )
+    if choice == "required" and not inventory:
+        raise HTTPException(
+            status_code=400,
+            detail="tool_choice 'required' needs at least one declared tool",
+        )
+    return choice
+
 
 def _generation_options(request_data: dict) -> dict:
     ollama_options = request_data.get("options")
@@ -134,6 +220,16 @@ def _generation_options(request_data: dict) -> dict:
         for source_name, target_name in _GENERATION_OPTION_ALIASES.items():
             if source_name in source:
                 generation[target_name] = _deep_sanitize(source[source_name])
+    output_allowance = generation.get("max_generated_tokens")
+    if output_allowance is not None and (
+        isinstance(output_allowance, bool)
+        or not isinstance(output_allowance, int)
+        or output_allowance < 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="max_generated_tokens must be a positive integer",
+        )
     return generation
 
 
@@ -291,6 +387,8 @@ def _build_inference_request(
     model = _find_configured_model(public_model_id)
     if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
+    _validate_text_only_messages(request_data)
+    _validate_request_options(request_data)
     messages = normalize_messages(request_data.get("messages", []))
     tools = request_data.get("tools")
     tool_inventory = {}
@@ -299,12 +397,10 @@ def _build_inference_request(
     if tools is not None:
         tools = _deep_sanitize(tools)
         tool_inventory = _validate_tool_inventory(tools)
-    tool_choice = request_data.get("tool_choice", "auto")
-    if not isinstance(tool_choice, str) or tool_choice not in ("auto", "none"):
-        raise HTTPException(
-            status_code=400,
-            detail="tool_choice must be 'auto' or 'none' for this backend",
-        )
+    tool_choice = _normalize_tool_choice(
+        request_data.get("tool_choice", "auto"),
+        tool_inventory,
+    )
     return ChatRequest(
         hef_path=model["hef_path"],
         messages=messages,
@@ -340,8 +436,20 @@ async def _run_chat_request(
         raise BackendGenerationError("Native Hailo returned an invalid response")
     result = _parse_generated_response(
         generated,
-        chat_request.tool_inventory if chat_request.tool_choice == "auto" else {},
+        chat_request.tool_inventory if chat_request.tool_choice != "none" else {},
     )
+    if chat_request.tool_choice == "required" and not result.tool_calls:
+        raise BackendGenerationError("No tool call was generated for required choice")
+    if chat_request.tool_choice.startswith("forced:"):
+        forced_name = chat_request.tool_choice.partition(":")[2]
+        if not result.tool_calls:
+            raise BackendGenerationError(
+                "No tool call was generated for the forced tool"
+            )
+        if any(call["name"] != forced_name for call in result.tool_calls):
+            raise BackendGenerationError(
+                "Generated tool call does not match the forced tool"
+            )
     return chat_request, result
 
 
@@ -438,6 +546,16 @@ def _parse_generated_response(
 
 
 def _backend_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, BackendContextOverflowError):
+        return JSONResponse(
+            status_code=413,
+            content={"error": str(exc), "code": "context_length_exceeded"},
+        )
+    if isinstance(exc, BackendOutputExhaustedError):
+        return JSONResponse(
+            status_code=502,
+            content={"error": str(exc), "code": "output_limit_exceeded"},
+        )
     if isinstance(exc, BackendBusyError):
         return JSONResponse(status_code=503, content={"error": str(exc)})
     if isinstance(exc, BackendTimeoutError):
@@ -594,8 +712,14 @@ async def chat_completions(request: Request) -> Any:
         return _openai_full_response(result, chat_request.public_model_id)
     except HTTPException:
         raise
-    except (BackendBusyError, BackendUnavailableError, BackendTimeoutError,
-            BackendGenerationError) as exc:
+    except (
+        BackendBusyError,
+        BackendContextOverflowError,
+        BackendGenerationError,
+        BackendOutputExhaustedError,
+        BackendTimeoutError,
+        BackendUnavailableError,
+    ) as exc:
         return _backend_error_response(exc)
     except Exception as exc:
         logger.exception("Error in chat adapter")
@@ -712,6 +836,12 @@ async def api_chat(request: Request) -> Any:
         return _ollama_full_response(result, chat_request.public_model_id)
     except HTTPException:
         raise
-    except (BackendBusyError, BackendUnavailableError, BackendTimeoutError,
-            BackendGenerationError) as exc:
+    except (
+        BackendBusyError,
+        BackendContextOverflowError,
+        BackendGenerationError,
+        BackendOutputExhaustedError,
+        BackendTimeoutError,
+        BackendUnavailableError,
+    ) as exc:
         return _backend_error_response(exc)

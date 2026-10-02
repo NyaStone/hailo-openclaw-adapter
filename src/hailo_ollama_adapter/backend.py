@@ -32,6 +32,17 @@ class BackendGenerationError(RuntimeError):
     """Raised when native generation fails and the backend becomes unhealthy."""
 
 
+class BackendContextOverflowError(RuntimeError):
+    """Raised when the rendered request cannot fit with its output allowance."""
+
+
+class BackendOutputExhaustedError(RuntimeError):
+    """Raised when generation reaches its output-token allowance."""
+
+
+_DEFAULT_OUTPUT_TOKEN_ALLOWANCE = 256
+
+
 @dataclass
 class _InferenceRequest:
     hef_path: str
@@ -170,6 +181,13 @@ class NativeHailoBackend:
                     job,
                 )
             except Exception as exc:
+                if isinstance(
+                    exc,
+                    (BackendContextOverflowError, BackendOutputExhaustedError),
+                ):
+                    if not job.result.done():
+                        job.result.set_exception(exc)
+                    continue
                 self._state = "failed"
                 self._error = type(exc).__name__
                 logger.exception("Direct Hailo generation failed")
@@ -200,12 +218,43 @@ class NativeHailoBackend:
                     native_message[field] = message[field]
             prompt.append(native_message)
 
+        from jinja2 import Template
+
         arguments = dict(job.generation)
-        if job.tools is not None and job.tool_choice == "auto":
-            arguments["tools"] = job.tools
-        result = llm.generate_all(prompt=prompt, **arguments)
+        output_allowance = arguments.get(
+            "max_generated_tokens",
+            _DEFAULT_OUTPUT_TOKEN_ALLOWANCE,
+        )
+        arguments["max_generated_tokens"] = output_allowance
+        native_tools = job.tools if job.tools and job.tool_choice != "none" else None
+        template = Template(llm.prompt_template())
+        rendered_prompt = template.render(
+            messages=prompt,
+            tools=native_tools or [],
+            add_generation_prompt=True,
+        )
+        prompt_tokens = len(llm.tokenize(rendered_prompt))
+        capacity = int(llm.max_context_capacity())
+        if prompt_tokens + output_allowance > capacity:
+            raise BackendContextOverflowError(
+                f"Rendered prompt ({prompt_tokens} tokens) plus output allowance "
+                f"({output_allowance} tokens) exceeds context capacity ({capacity})"
+            )
+        if native_tools is not None:
+            arguments["tools"] = native_tools
+        with llm.generate(prompt=prompt, **arguments) as completion:
+            result = completion.read_all(timeout_ms=600000)
+            completion_status = completion.generation_status
         if not isinstance(result, str):
             raise TypeError("HailoRT returned a non-text generation result")
+        generated_tokens = int(llm.get_context_usage_size()) - prompt_tokens
+        status_name = getattr(completion_status, "name", str(completion_status)).upper()
+        if generated_tokens >= output_allowance or any(
+            marker in status_name for marker in ("MAX_TOKEN", "TOKEN_LIMIT", "LENGTH")
+        ):
+            raise BackendOutputExhaustedError(
+                "Generation stopped at the output token limit before a normal stop"
+            )
         return _clean_generated_text(result)
 
     def _fail_queued(self) -> None:

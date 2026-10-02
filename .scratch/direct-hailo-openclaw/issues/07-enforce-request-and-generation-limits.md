@@ -4,7 +4,7 @@
 
 **Blocked by:** 05: Complete the non-streaming tool handshake; 06: Stream text and tool-call responses.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Unsupported media and generation options are explicitly rejected for models that cannot handle them.
 - [ ] OpenAI-compatible `tool_choice` values for none, required, and a forced tool name are enforced or explicitly rejected when unsupported.

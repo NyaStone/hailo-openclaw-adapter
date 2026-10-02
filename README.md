@@ -52,6 +52,15 @@ backends can exercise the HTTP API without an accelerator runtime installed.
 - **Readiness and failure states.** `/readyz` reports initialization and
   inference health; initialization, generation, and cleanup failures are
   surfaced rather than returned as empty assistant text.
+- **Explicit request limits.** Text-only models reject media and unsupported
+  generation options. The complete model-rendered transcript and tool schemas
+  are tokenized with the requested output allowance before generation; overflow
+  returns HTTP 413 without dropping history. The default output allowance is
+  256 tokens, and reaching it is reported as output exhaustion, not a normal
+  stop.
+- **Enforced tool choice.** `auto`, `none`, `required`, and a forced declared
+  function are validated. Required and forced choices fail instead of returning
+  ordinary text or a different executable call.
 - **Installable package.** You can now `pip3 install` directly from
   GitHub and get a `hailo-ollama-adapter` command, rather than cloning
   and running `uvicorn` against a loose file.
