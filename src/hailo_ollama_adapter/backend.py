@@ -71,6 +71,7 @@ class NativeHailoBackend:
         self._worker: asyncio.Task[None] | None = None
         self._vdevice: Any = None
         self._models: dict[str, Any] = {}
+        self._model_context_lengths: dict[str, int] = {}
 
     @property
     def status(self) -> dict[str, Any]:
@@ -109,6 +110,17 @@ class NativeHailoBackend:
             logger.exception("Failed to initialize direct Hailo backend")
             return
 
+        for model in models:
+            capacity = self._model_context_lengths.get(model["hef_path"])
+            if capacity is None:
+                self._state = "failed"
+                self._error = "HailoRT did not report an HEF context capacity"
+                await loop.run_in_executor(self._executor, self._release_native)
+                self._executor.shutdown(wait=True)
+                self._executor = None
+                return
+            model["model_info"] = {"hailo.context_length": capacity}
+
         self._queue = asyncio.Queue(maxsize=self._queue_size)
         self._state = "ready"
         self._worker = asyncio.create_task(self._run_worker())
@@ -123,7 +135,13 @@ class NativeHailoBackend:
         self._vdevice = VDevice(params)
         try:
             for path in model_paths:
-                self._models[path] = LLM(self._vdevice, path)
+                llm = LLM(self._vdevice, path)
+                capacity = int(llm.max_context_capacity())
+                if capacity < 1:
+                    llm.release()
+                    raise RuntimeError(f"HEF reported invalid context capacity: {path}")
+                self._models[path] = llm
+                self._model_context_lengths[path] = capacity
         except Exception:
             self._release_native()
             raise

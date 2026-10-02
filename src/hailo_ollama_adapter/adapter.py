@@ -53,11 +53,19 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
             queue_size = 0
         backend = NativeHailoBackend(queue_size=queue_size)
         application.state.inference_backend = backend
-    await backend.start(_configured_models())
+    models = _configured_models()
+    await backend.start(models)
+    if not backend.status["ready"]:
+        await backend.close()
+        raise RuntimeError(
+            f"Hailo backend failed to start: {backend.status['error']}"
+        )
+    application.state.configured_models = models
     try:
         yield
     finally:
         await backend.close()
+        del application.state.configured_models
 
 
 app = FastAPI(title="Hailo Adapter", version="1.0.0", lifespan=_lifespan)
@@ -587,34 +595,50 @@ def _backend_error_response(exc: Exception) -> JSONResponse:
 # Model discovery
 # --------------------------------------------------------------------------- #
 
-_VALIDATED_HEF_PROFILES = {
-    "Qwen2.5-Coder-1.5B-Instruct.hef": {
-        "details": {
-            "format": "hef",
-            "family": "qwen2",
-            "families": ["qwen2"],
-            "parameter_size": "1.5B",
-        },
-        "context_length": 2048,
-        "capabilities": ["completion", "tools"],
-    },
-}
+def _hailo_apps_model_catalog() -> list[dict[str, str]]:
+    """Return installed LLM HEFs from Hailo Apps' agent model catalog."""
+    try:
+        from hailo_apps.config.config_manager import get_model_info, get_model_names
+        from hailo_apps.python.core.common.core import get_resource_path
+        from hailo_apps.python.core.common.installation_utils import detect_hailo_arch
+    except ImportError as exc:
+        raise RuntimeError(
+            "Hailo Apps is required to discover configured LLM HEFs"
+        ) from exc
+
+    arch = os.environ.get("HAILO_ARCH") or detect_hailo_arch()
+    if not arch:
+        raise RuntimeError("Hailo Apps could not detect the connected architecture")
+
+    catalog = []
+    for model_name in get_model_names("agent", arch, tier="all"):
+        entry = get_model_info("agent", arch, model_name)
+        if entry is None or entry.source != "gen-ai-mz":
+            continue
+        hef_path = get_resource_path("agent", "models", arch, model_name)
+        if hef_path is None or not hef_path.is_file():
+            continue
+        catalog.append({"name": model_name, "hef_path": str(hef_path.resolve())})
+    return catalog
 
 
 def _configured_models() -> list[dict]:
-    """Return existing HEFs explicitly mapped to validated model profiles."""
-    config_error = (
-        "HAILO_MODELS must be a JSON object mapping public IDs to HEF paths"
-    )
-    raw_mapping = os.environ.get("HAILO_MODELS", "{}")
-    try:
-        mapping = json.loads(raw_mapping)
-    except json.JSONDecodeError:
-        logger.error(config_error)
-        return []
-    if not isinstance(mapping, dict):
-        logger.error(config_error)
-        return []
+    """Return installed Hailo Apps agent HEFs, optionally assigning public IDs."""
+    catalog = _hailo_apps_model_catalog()
+    models_by_name = {model["name"]: model for model in catalog}
+    raw_mapping = os.environ.get("HAILO_MODELS")
+    if raw_mapping is None:
+        mapping = {
+            model["name"]: model["hef_path"]
+            for model in catalog
+        }
+    else:
+        try:
+            mapping = json.loads(raw_mapping)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("HAILO_MODELS must be a JSON object") from exc
+        if not isinstance(mapping, dict):
+            raise RuntimeError("HAILO_MODELS must be a JSON object")
 
     models = []
     for model_id, raw_path in mapping.items():
@@ -625,9 +649,10 @@ def _configured_models() -> list[dict]:
         ):
             continue
         path = Path(raw_path)
-        profile = _VALIDATED_HEF_PROFILES.get(path.name)
-        if profile is None:
-            logger.warning("Ignoring HEF without a validated profile: %s", path.name)
+        model_name = path.name.removesuffix(".hef")
+        catalog_model = models_by_name.get(model_name)
+        if catalog_model is None:
+            logger.warning("Ignoring HEF not listed by Hailo Apps agent: %s", path)
             continue
         try:
             file_stat = path.stat()
@@ -636,7 +661,6 @@ def _configured_models() -> list[dict]:
         if not path.is_file():
             continue
 
-        family = profile["details"]["family"]
         models.append({
             "name": model_id,
             "model": model_id,
@@ -646,17 +670,26 @@ def _configured_models() -> list[dict]:
             ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "size": file_stat.st_size,
             "digest": "",
-            "details": profile["details"],
-            "model_info": {f"{family}.context_length": profile["context_length"]},
-            "capabilities": profile["capabilities"],
-            "hef_path": str(path),
+            "details": {"format": "hef"},
+            "model_info": {},
+            "capabilities": ["completion", "tools"],
+            "hef_path": str(path.resolve()),
         })
+    if not models:
+        raise RuntimeError(
+            "No installed LLM HEFs are available in the Hailo Apps agent catalog"
+        )
     return models
+
+
+def _active_models() -> list[dict]:
+    models = getattr(app.state, "configured_models", None)
+    return models if models is not None else _configured_models()
 
 
 def _find_configured_model(name: str) -> dict | None:
     return next(
-        (model for model in _configured_models() if model["name"] == name),
+        (model for model in _active_models() if model["name"] == name),
         None,
     )
 
@@ -670,7 +703,7 @@ def _ollama_model_info(model: dict) -> dict:
 
 async def _get_models() -> list[dict]:
     """Read configured usable models without acquiring the inference slot."""
-    return _configured_models()
+    return _active_models()
 
 
 async def _get_model_details(name: str) -> dict:
