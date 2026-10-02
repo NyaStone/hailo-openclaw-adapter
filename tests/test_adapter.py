@@ -114,6 +114,26 @@ async def test_unknown_model_details_return_not_found(
     assert response.status_code == 404
 
 
+def test_chat_payload_selects_the_configured_local_hef(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    hef_path = tmp_path / "Qwen2.5-Coder-1.5B-Instruct.hef"
+    hef_path.touch()
+    monkeypatch.setenv("HAILO_MODELS", json.dumps({"public-id": str(hef_path)}))
+
+    payload, _, response_model = adapter._build_payload(
+        {
+            "model": "public-id",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        default_stream=False,
+    )
+
+    assert json.loads(payload)["model"] == str(hef_path)
+    assert response_model == "public-id"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/api/chat", "/v1/chat/completions"])
 async def test_unknown_chat_model_is_rejected_before_upstream_call(

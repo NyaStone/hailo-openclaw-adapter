@@ -307,20 +307,21 @@ def _build_payload(
     default_stream: bool,
 ) -> tuple[bytes, bool, str]:
     is_stream = request_data.get("stream", default_stream)
-    model_name = request_data.get("model")
-    if not isinstance(model_name, str) or not model_name:
+    public_model_id = request_data.get("model")
+    if not isinstance(public_model_id, str) or not public_model_id:
         raise HTTPException(status_code=400, detail="A model ID is required")
-    if _find_configured_model(model_name) is None:
+    model = _find_configured_model(public_model_id)
+    if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
     messages = assemble_messages_for_hailo(
         normalize_messages(request_data.get("messages", []))
     )
     body = _encode_for_hailo({
-        "model": model_name,
+        "model": model["hef_path"],
         "messages": messages,
         "stream": is_stream,
     })
-    return body, is_stream, model_name
+    return body, is_stream, public_model_id
 
 
 async def _acquire_hailo_slot() -> None:
@@ -580,12 +581,10 @@ def _extract_content(hailo_json: dict) -> str:
 _VALIDATED_HEF_PROFILES = {
     "Qwen2.5-Coder-1.5B-Instruct.hef": {
         "details": {
-            "parent_model": "",
             "format": "hef",
             "family": "qwen2",
             "families": ["qwen2"],
             "parameter_size": "1.5B",
-            "quantization_level": "unknown",
         },
         "context_length": 2048,
         "capabilities": ["completion", "tools"],
